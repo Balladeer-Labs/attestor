@@ -6,11 +6,39 @@ release. Branches and tags are navigation aids only; they never authorize eviden
 
 ## Repository protection
 
-Protect `main` with a repository ruleset that requires pull requests, CODEOWNERS review,
-dismisses stale approvals, requires the `verify-release` job, and blocks force pushes and
-branch deletion. Enable private vulnerability reporting and secret scanning. Releases
-must be created by a Balladeer maintainer; GitHub write access is not delegated to a
-customer repository or its Actions token.
+`main` is protected by a repository ruleset that requires a pull request, CODEOWNERS
+review, dismissal of stale approvals, approval of the last push, resolved review threads,
+and a green `verify-release` check on an up-to-date branch. Merge commits are the only
+permitted merge method, so a released commit is never rewritten on its way to `main`.
+Force pushes and branch deletion are blocked. Private vulnerability reporting, secret
+scanning, and push protection are enabled. Releases must be created by a Balladeer
+maintainer; GitHub write access is not delegated to a customer repository or its Actions
+token.
+
+Read that protection together with the single-maintainer exception below, which states
+what it does and does not prove today.
+
+## Bootstrap exception: one maintainer
+
+Balladeer has one maintainer, who is also the sole CODEOWNER in `.github/CODEOWNERS`.
+GitHub does not allow an author to approve their own pull request, so the approval rule
+above cannot be satisfied honestly at this size. Rather than weaken the rule or add a
+second account that is really the same person, the organization owner holds a recorded
+bypass on the ruleset and merges through it.
+
+What a reader may and may not conclude from a release commit while this exception stands:
+
+- Every commit on `main` reached it through a pull request whose `verify-release` check was
+  green, and is protected against rewriting and deletion. Those claims are true now.
+- A release commit has not been reviewed by a second person. A merged pull request in this
+  repository is not evidence of independent review.
+- Each bypassed merge is recorded by GitHub in this repository's rule insights, so the
+  exception is inspectable here rather than merely asserted.
+
+This exception ends when a second maintainer exists. Add them to `.github/CODEOWNERS`,
+remove the bypass actor from the ruleset, and delete this section in the same pull request.
+Until then this section, not the presence of protection, is the accurate statement of what
+review a release has had.
 
 ## Publishing a release
 
