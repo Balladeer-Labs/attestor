@@ -1,0 +1,27 @@
+{
+  "name": "@balladeer/continuity-runner",
+  "version": "0.1.0",
+  "private": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Balladeer-Labs/attestor.git",
+    "directory": "packages/continuity-runner"
+  },
+  "type": "module",
+  "bin": {
+    "continuity-runner": "dist/cli.js"
+  },
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:release": "tsc -p tsconfig.release.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

@@ -1,0 +1,11 @@
+# Every public trust-anchor change requires review by the Balladeer owner.
+* @Bobby-tables1
+
+# Call these out explicitly because a change alters what customer CI executes
+# or what GitHub identity the Balladeer control plane will accept.
+/.github/workflows/ @Bobby-tables1
+/release/ @Bobby-tables1
+/packages/continuity-runner/ @Bobby-tables1
+/scripts/ @Bobby-tables1
+/SECURITY.md @Bobby-tables1
+/RELEASE-POLICY.md @Bobby-tables1
