@@ -6,9 +6,11 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const expected = new Set([
   ".gitignore",
   ".gitattributes",
+  "CLAUDE.md",
   "LICENSE",
   "README.md",
   "RELEASE-POLICY.md",
+  "SECURITY-REVIEW.md",
   "SECURITY.md",
   "TRUST-BOUNDARY.md",
   "package.json",
@@ -58,6 +60,8 @@ const runner = contents.get("packages/continuity-runner/src/index.ts");
 const runnerCli = contents.get("packages/continuity-runner/src/cli.ts");
 const readme = contents.get("README.md");
 const security = contents.get("SECURITY.md");
+const securityReview = contents.get("SECURITY-REVIEW.md");
+const claude = contents.get("CLAUDE.md");
 const license = contents.get("LICENSE");
 const codeowners = contents.get(".github/CODEOWNERS");
 const packageJson = JSON.parse(contents.get("package.json"));
@@ -212,6 +216,27 @@ const assertions = [
     "caller documents required permissions",
   ],
   [security.includes("https://attest.balladeer.ai"), "documented fixed egress"],
+  [
+    readme.includes("SECURITY-REVIEW.md") && readme.includes("CLAUDE.md"),
+    "cold-start safeguards linked from README",
+  ],
+  [
+    claude.includes("job.workflow_repository") &&
+      claude.includes("job.workflow_sha") &&
+      claude.includes("control-plane response") &&
+      claude.includes("There is no caller-supplied setup hook") &&
+      claude.includes("Do not merge, tag, register a production-supported release"),
+    "agent instructions preserve executable-selection and release gates",
+  ],
+  [
+    securityReview.includes("Original trust failure") &&
+      securityReview.includes("registration response selected an attestor repository and SHA") &&
+      securityReview.includes("Exact re-test categories") &&
+      securityReview.includes("separate-owner, synthetic GitHub repository") &&
+      securityReview.toLowerCase().includes("private control-plane draft pr") &&
+      securityReview.includes("8add088"),
+    "security review preserves failure, adversarial gates, and paired handoff",
+  ],
   [codeowners.includes("@Bobby-tables1"), "release owner"],
   [lockfile.isFile && lockfile.size > 0, "frozen dependency lockfile"],
   [!files.some((file) => file.endsWith(".env") || file.includes("customer")), "no customer or environment files"],

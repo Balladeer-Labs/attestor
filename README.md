@@ -15,8 +15,10 @@ customer acceptance envelopes, fixtures, verifier programs or output, credential
 deployment history. The CI origin and GitHub OIDC audience are hard-coded into the
 released workflow; callers cannot redirect its identity token or results.
 
-See [TRUST-BOUNDARY.md](TRUST-BOUNDARY.md) for the exact information exchange and
-[RELEASE-POLICY.md](RELEASE-POLICY.md) for upgrade, rollback, and revocation rules.
+See [TRUST-BOUNDARY.md](TRUST-BOUNDARY.md) for the exact information exchange,
+[SECURITY-REVIEW.md](SECURITY-REVIEW.md) for the original trust failure and mandatory
+re-test gates, and [RELEASE-POLICY.md](RELEASE-POLICY.md) for upgrade, rollback, and
+revocation rules. Coding agents must read [CLAUDE.md](CLAUDE.md) before making changes.
 
 ## How a customer uses a release
 
@@ -82,7 +84,10 @@ pnpm run check-release
 
 After `build:release`, review both the source and generated runner diff. The deterministic
 release check verifies the fixed endpoint/audience, immutable action pins, exact public
-file inventory, secret and private-path absence, and byte-for-byte runner reproducibility.
+file inventory, mandatory handoff safeguards, secret and private-path absence, and
+byte-for-byte runner reproducibility. These deterministic checks do not replace the
+independent review or cross-repository canaries in
+[SECURITY-REVIEW.md](SECURITY-REVIEW.md).
 
 ## License
 
