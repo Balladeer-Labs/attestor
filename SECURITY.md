@@ -32,6 +32,14 @@ every regular file in that tree, symbolic links and special files are rejected, 
 declared byte is digest-checked before sealing, qualification, and execution. The declared
 verifier command must point to a verifier inside the same tree.
 
+Preparation scripts are therefore digest-locked, but their outputs must not be. Exact
+closure over the envelope tree is re-evaluated immediately before every control and before
+the target run, so any file a preparation step creates inside that tree makes the run
+`custody-invalid` rather than failing it. Installs, package-manager and build caches,
+compiled artifacts, virtual environments, regenerated lockfiles, and scratch files belong
+outside `.continuity/envelopes/<envelope-id>/`. This is a deliberate consequence of the
+closure rule and not a limitation to be worked around by removing files from the package.
+
 A verifier can import or invoke application code outside its envelope tree because that
 code is the system under test. Those external dependencies are not verifier custody. If a
 helper determines how the promise is asserted rather than implementing the product being

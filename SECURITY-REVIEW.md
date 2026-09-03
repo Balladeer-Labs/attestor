@@ -99,17 +99,19 @@ production-supported. Tags are optional discovery metadata and never authorizati
 ## Relationship to the private control plane
 
 This public draft is one half of a two-repository change. Private control-plane draft PR
-#1, at handoff commit `8add088`, implements the application-side lifecycle and release
-authority it expects to pair with this workflow. That private commit is coordination
-context, not trusted executable input and not proof that either side is ready.
+#1, at https://github.com/Bobby-tables1/balladeer/pull/1, implements the application-side
+lifecycle and release authority it expects to pair with this workflow; the exact private
+head that currently carries a finished green verdict is recorded in that repository's
+`docs/continuation-handoff.md`, not here, so this document never pins a commit it cannot
+keep true. That private work is coordination context, not trusted executable input and not
+proof that either side is ready.
 
 Before an end-to-end canary, compare the two exact heads for protocol fields, fixed origin
 and audience, GitHub OIDC claims, release/enrollment standing, challenge replay rules,
 manifest/result schemas, and revocation behavior. Keep implementation details and all
-private identifiers in the private repository. If the private head changes, record its
-new coordination commit in that repository's handoff; do not copy its source or secrets
-here. The public runner and workflow remain independently reviewable and are selected
-only by GitHub-owned workflow identity.
+private identifiers in the private repository, including the coordination commit itself;
+do not copy its source or secrets here. The public runner and workflow remain
+independently reviewable and are selected only by GitHub-owned workflow identity.
 
 Neither draft is merged, tagged, production-registered, or approved for customer use
 merely because this checklist exists. The release gates above and the private

@@ -234,7 +234,7 @@ const assertions = [
       securityReview.includes("Exact re-test categories") &&
       securityReview.includes("separate-owner, synthetic GitHub repository") &&
       securityReview.toLowerCase().includes("private control-plane draft pr") &&
-      securityReview.includes("8add088"),
+      securityReview.includes("https://github.com/Bobby-tables1/balladeer/pull/1"),
     "security review preserves failure, adversarial gates, and paired handoff",
   ],
   [codeowners.includes("@Bobby-tables1"), "release owner"],

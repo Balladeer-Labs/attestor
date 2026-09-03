@@ -63,6 +63,17 @@ acceptance package. The verifier may still exercise application code and depende
 outside that tree as its system under test; those external files are not covered by the
 verifier-custody claim.
 
+Preparation scripts and their outputs are governed differently, and getting this backwards
+is the most common way to make a correct verifier report `custody-invalid`. The script
+itself must live inside `.continuity/envelopes/<envelope-id>/`, be declared as support
+material, and stay byte-identical to its recorded digest. Anything the script produces must
+be written outside that tree: installed dependencies, package-manager and build caches,
+compiled output, virtual environments, lockfiles it regenerates, and scratch files.
+The runner re-checks exact closure over the envelope tree immediately before every control
+and before the target run, so a single generated file appearing inside it makes that run
+custody-invalid even though nothing a human authored has changed. Write to the repository
+working directory, a temporary directory, or the runner's own scratch space instead.
+
 Controls and envelopes execute serially by default because customer verifiers may share
 databases, queues, ports, or other mutable fixtures. Individual verifier processes remain
 time-bounded, and the surrounding GitHub jobs have explicit wall-clock limits.
