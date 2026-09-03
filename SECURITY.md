@@ -55,6 +55,28 @@ choose the repository, revision, or executable.
 These workflow-identity properties are unavailable on GitHub Enterprise Server, which is
 therefore outside the v0 support boundary.
 
+## Verifier output goes to the customer's own log
+
+The runner has two output channels and they never mix. Standard output carries the closed
+result JSON that the workflow redirects into the artifact a token-bearing job publishes.
+Standard error carries what a person reads: each verifier's own stdout and stderr, a
+sentence per envelope naming the envelope, the control, the outcome and the approved
+observable outcome, a GitHub annotation, and a job-summary table.
+
+That explanation reaches the customer's own GitHub job log only. It is never added to a
+result, a digest, or any request to Balladeer, and Balladeer never receives it. The
+published payload is exactly what it was before verifier output became visible: normalized
+outcomes and SHA-256 digests over the raw bytes.
+
+Echoed text is untrusted input to that log: verifier bytes, package prose written by the
+customer, and envelope ids from the frozen manifest. GitHub Actions reads workflow commands
+such as `::error::` from a job's output, so every echoed line is stripped of control
+characters, capped in length, and printed behind a fixed `[balladeer]` prefix. Echoed text
+can never begin a line and therefore cannot forge an annotation, a job-summary write, or
+any other workflow command. The echo is bounded at the same 1 MiB per stream the digests
+use, counted in bytes written to the log so that short lines cannot multiply through the
+prefix. Nothing from a control-plane response is printed beyond bounded envelope ids.
+
 ## Fixed destinations
 
 Balladeer-authored HTTP requests go only to `https://attest.balladeer.ai`. OIDC tokens

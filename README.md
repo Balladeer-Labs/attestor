@@ -78,6 +78,21 @@ Controls and envelopes execute serially by default because customer verifiers ma
 databases, queues, ports, or other mutable fixtures. Individual verifier processes remain
 time-bounded, and the surrounding GitHub jobs have explicit wall-clock limits.
 
+## Reading a failing check
+
+The runner writes each verifier's own stdout and stderr into the GitHub job log, one line
+at a time behind a `[balladeer]` prefix, followed by a sentence per envelope naming the
+envelope, the control, the outcome, and the approved observable outcome. The same lines
+appear as GitHub annotations and as a job-summary table. All of it stays in the customer's
+own run: Balladeer still receives only normalized outcomes and SHA-256 digests. See
+[SECURITY.md](SECURITY.md) for the exact boundary.
+
+Every envelope in the frozen manifest produces exactly one result. An envelope whose sealed
+package is missing, re-sealed since activation, ambiguous, or unreadable is reported as
+`custody-invalid` on its own, with no verifier run, while every other envelope in the same
+manifest still executes and publishes. One broken package therefore never blanks the
+catalog.
+
 Never enroll a mutable branch or tag. Tags may make a release easier for people to find,
 but customer callers pin the full 40-character commit SHA.
 

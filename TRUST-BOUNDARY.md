@@ -9,7 +9,7 @@ fixtures, verifier programs, prompts, or raw verifier output.
 | Moment | Customer/GitHub sends to Balladeer | Balladeer sends back | Remains in the customer's GitHub run |
 | --- | --- | --- | --- |
 | Enrollment run | A GitHub-signed OIDC token; workspace locator; repository name, numeric repository ID, numeric owner ID; caller ref, workflow name, workflow ref and workflow SHA; event name; run ID and attempt; base, head, and target commit SHAs | A target UUID, one-run challenge, and frozen active manifest containing only target ID, generation time, envelope IDs, package digests, and manifest digest | Repository contents and credentials |
-| Verification | Nothing while verifiers execute | Nothing | Source, packages, fixtures, commands, stdout, and stderr |
+| Verification | Nothing while verifiers execute | Nothing | Source, packages, fixtures, commands, stdout, and stderr, including the verifier output echoed into the customer's own job log |
 | Result publication | A fresh GitHub-signed OIDC token; protocol version and target mode; workspace locator, target UUID, manifest digest, run ID, one-run challenge; per-envelope runner version, envelope ID, package digest, source SHA, control, normalized outcome, exit code, duration, start/completion times, custody state, stdout/stderr/result digests; and a map of envelope IDs to null shadow-applicability observations | HTTP acceptance or a closed validation error | Raw output and files used to reach the outcome |
 | Qualification on the default branch | A fresh GitHub-signed OIDC token and closed receipt: protocol version; receipt/workspace/revision/binding IDs; repository name and numeric ID; ref, workflow name/ref/SHA; run ID/attempt, event, target/source SHA; semantic, package, verifier, fixture, and workflow digests; recorded time; and good/bad/refactor/tamper outcomes plus result digests | HTTP acceptance or a closed validation error | Files, commands, and raw outputs behind the digests |
 
@@ -17,6 +17,28 @@ The non-secret workspace locator routes a run to the correct Balladeer workspace
 does not authorize anything. Authorization comes from GitHub's signed OIDC token and
 the server's match against the enrolled repository, caller workflow, and immutable
 `Balladeer-Labs/attestor` workflow SHA.
+
+## What the customer sees, and Balladeer does not
+
+The runner writes each verifier's own stdout and stderr to its standard error, which is
+the customer's own GitHub job log. Alongside it, it writes one sentence per envelope
+naming the envelope, the control, the outcome and the approved observable outcome, the
+matching GitHub annotation, and a job-summary table. A failing check is therefore readable
+by the person who caused it.
+
+All of that stays inside the customer's GitHub run. Verifier output goes to the customer's
+own job log only: it is never part of a result, a digest, or a request to Balladeer, and it
+is not among the fields listed in the table above. The runner's standard output remains the
+single machine channel, carrying only the closed result JSON. Echoed text is bounded at
+1 MiB per stream, stripped of control characters, and always printed behind a fixed
+`[balladeer]` prefix so that customer bytes can never begin a line and forge a GitHub
+workflow command. Nothing a control-plane response returned is printed beyond bounded
+envelope ids.
+
+An envelope whose sealed package is missing, re-sealed, or ambiguous is reported as one
+custody-invalid result for that envelope, so the other envelopes in the same run still
+execute and publish. The result carries the package digest the frozen manifest expected;
+no verifier runs for it.
 
 ## Job isolation
 

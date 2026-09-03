@@ -1,7 +1,17 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { isAbsolute, relative, resolve as pathResolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 export const RUNNER_SCHEMA = "continuity-package/v1" as const;
 export const RUNNER_VERSION = "0.1.0";
@@ -383,6 +393,50 @@ export async function readPackages(path: string): Promise<AcceptancePackage[]> {
       packages.push(await readPackage(child));
   }
   return packages;
+}
+
+/**
+ * Read every sealed package that can be read, and report the files that cannot
+ * instead of failing the whole catalog. A file that does not validate simply
+ * does not answer for its envelope: the manifest selection then reports that
+ * envelope as custody-invalid, exactly as a deleted file would, and every other
+ * envelope still runs. A package directory that does not exist yields no
+ * packages rather than an error, for the same reason.
+ *
+ * The returned file names are for the customer's own log. They are never part
+ * of a result and never leave the customer's runner.
+ */
+export async function readAvailablePackages(
+  path: string,
+): Promise<{ packages: AcceptancePackage[]; rejected: string[] }> {
+  const packages: AcceptancePackage[] = [];
+  const rejected: string[] = [];
+  const info = await stat(path).catch(() => undefined);
+  if (info?.isFile()) {
+    try {
+      packages.push(await readPackage(path));
+    } catch {
+      rejected.push(path);
+    }
+    return { packages, rejected };
+  }
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => undefined);
+    if (!entries) return;
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const child = `${directory}/${entry.name}`;
+      if (entry.isDirectory()) await visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".json")) {
+        try {
+          packages.push(await readPackage(child));
+        } catch {
+          rejected.push(child);
+        }
+      }
+    }
+  };
+  await visit(path);
+  return { packages, rejected };
 }
 
 async function envelopeMaterialInventory(
@@ -863,23 +917,87 @@ export function validateExecutionManifest(input: unknown): ExecutionManifest {
   return input as unknown as ExecutionManifest;
 }
 
-export function selectManifestPackages(
+export type PackageUnavailableReason = "missing" | "digest-changed" | "ambiguous";
+export type ManifestEntrySelection =
+  | { kind: "package"; envelopeId: string; package: AcceptancePackage }
+  | {
+      kind: "unavailable";
+      envelopeId: string;
+      packageDigest: string;
+      reason: PackageUnavailableReason;
+    };
+export type ManifestRunMode = "target" | "exercise";
+
+/**
+ * Resolve every manifest entry on its own. A missing, re-sealed, or ambiguous
+ * package used to throw before any verifier ran, so the control plane received
+ * no results at all and swept every other envelope into the same missing state.
+ * Each entry now resolves to exactly one answer: a package to run, or a
+ * custody-invalid verdict for that envelope alone. Manifest cardinality is
+ * preserved either way.
+ */
+export function selectManifestEntries(
   packages: AcceptancePackage[],
   manifestInput: ExecutionManifest,
-): AcceptancePackage[] {
+): ManifestEntrySelection[] {
   const manifest = validateExecutionManifest(manifestInput);
   const byId = new Map<string, AcceptancePackage>();
+  const ambiguous = new Set<string>();
   for (const pkg of packages) {
-    if (byId.has(pkg.envelope.id)) throw new Error("package directory has duplicate envelope id");
-    byId.set(pkg.envelope.id, pkg);
+    if (byId.has(pkg.envelope.id)) ambiguous.add(pkg.envelope.id);
+    else byId.set(pkg.envelope.id, pkg);
   }
-  return manifest.envelopes.map((entry) => {
+  return manifest.envelopes.map((entry): ManifestEntrySelection => {
+    const unavailable = (reason: PackageUnavailableReason): ManifestEntrySelection => ({
+      kind: "unavailable",
+      envelopeId: entry.id,
+      packageDigest: entry.packageDigest,
+      reason,
+    });
+    // A duplicate id is never resolved by preference: the run cannot tell which
+    // sealed package the manifest meant, so that envelope stays custody-invalid
+    // rather than executing a guess.
+    if (ambiguous.has(entry.id)) return unavailable("ambiguous");
     const pkg = byId.get(entry.id);
-    if (!pkg) throw new Error(`required package is missing: ${entry.id}`);
-    if (pkg.packageDigest !== entry.packageDigest)
-      throw new Error(`required package digest changed: ${entry.id}`);
-    return pkg;
+    if (!pkg) return unavailable("missing");
+    if (pkg.packageDigest !== entry.packageDigest) return unavailable("digest-changed");
+    return { kind: "package", envelopeId: entry.id, package: pkg };
   });
+}
+
+/**
+ * Run the selected manifest entries serially. Target mode produces one result
+ * per entry and exercise mode produces one per control, so the count the
+ * control plane checks against the frozen manifest is the same whether a
+ * package ran or was unavailable.
+ */
+export async function runManifestEntries(
+  selections: ManifestEntrySelection[],
+  mode: ManifestRunMode,
+  executionRoot = process.cwd(),
+  sourceSha = process.env.BALLADEER_SOURCE_SHA ?? process.env.GITHUB_SHA,
+): Promise<RunResult[]> {
+  const results: RunResult[] = [];
+  if (selections.length === 0) return results;
+  if (!isGitSha(sourceSha)) throw new Error("sourceSha must be an exact 40-hex commit SHA");
+  const controls: RunMode[] = mode === "target" ? ["target"] : [...CONTROLS];
+  for (const selection of selections)
+    for (const control of controls)
+      results.push(
+        selection.kind === "package"
+          ? await runVerifier(selection.package, control, executionRoot, sourceSha)
+          : closedResult(
+              selection.envelopeId,
+              selection.packageDigest,
+              control,
+              new Date(),
+              sourceSha,
+              "custody-invalid",
+              null,
+              "invalid",
+            ),
+      );
+  return results;
 }
 
 function digestStream(value: string): string {
@@ -959,6 +1077,169 @@ export function validateResult(input: unknown): RunResult {
   return input as unknown as RunResult;
 }
 
+// ---------------------------------------------------------------------------
+// The runner has two output channels and they never mix.
+//
+// Standard output carries the closed result JSON and nothing else: the caller
+// workflow redirects it into the artifact that token-bearing jobs publish.
+// Standard error carries everything a person reads, including each verifier's
+// own stdout and stderr, so a red check explains itself in the customer's own
+// GitHub job log. Echoed output never reaches a result field, a digest, or the
+// published payload; it stays inside the customer's run.
+//
+// Everything echoed is untrusted text: verifier bytes, package prose written by
+// the customer, and envelope ids from the frozen manifest. GitHub Actions reads
+// workflow commands such as `::error::` from a job's output, so echoed text is
+// stripped of control characters, bounded, and always printed behind a fixed
+// prefix. It can never begin a line, and therefore can never forge a command,
+// an annotation, or a job-summary write.
+// ---------------------------------------------------------------------------
+
+const humanPrefix = "[balladeer]";
+const outputLimit = 1_048_576;
+const csiSequence = /\u001b\[[0-9;:?]*[\u0020-\u002f]*[@-~]/g;
+const controlCharacter = /[\u0000-\u001f\u007f]/g;
+
+function loggable(value: string, limit: number): string {
+  const flattened = value.replace(csiSequence, "").replace(controlCharacter, " ");
+  return flattened.length > limit ? `${flattened.slice(0, limit)} [truncated]` : flattened;
+}
+
+function humanLine(text: string): void {
+  process.stderr.write(`${humanPrefix} ${text}\n`);
+}
+
+function annotate(level: "notice" | "error", message: string): void {
+  if (process.env.GITHUB_ACTIONS !== "true") return;
+  // GitHub decodes %25, %0A, and %0D inside an annotation message. The message
+  // has already lost every control character, so only the escape character
+  // itself still has to be escaped.
+  process.stderr.write(`::${level}::${message.replace(/%/g, "%25")}\n`);
+}
+
+interface OutputEcho {
+  add: (chunk: Buffer, stream: "stdout" | "stderr") => void;
+  flush: () => void;
+}
+
+/**
+ * Echo one verifier process's output to the human channel, line by line, under
+ * the same 1 MiB per-stream bound the digests use. The bound counts the bytes
+ * actually written to the log, not the bytes the verifier produced: a stream of
+ * very short lines would otherwise multiply through the per-line prefix. Each
+ * line is capped as well, so one enormous line cannot fill the bound alone.
+ *
+ * The digest is still computed over every raw byte the verifier wrote. Only
+ * what a person reads is bounded and sanitized.
+ */
+function outputEcho(envelopeId: string, control: RunMode): OutputEcho {
+  const decoder = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
+  const pending = { stdout: "", stderr: "" };
+  const echoed = { stdout: 0, stderr: 0 };
+  const stopped = { stdout: false, stderr: false };
+  const prefix = `${humanPrefix} ${loggable(envelopeId, 80)} ${control}`;
+  const line = (stream: "stdout" | "stderr", text: string): void => {
+    if (stopped[stream]) return;
+    const rendered = `${prefix} ${stream}: ${loggable(text, 4_000)}\n`;
+    if (echoed[stream] + Buffer.byteLength(rendered) > outputLimit) {
+      stopped[stream] = true;
+      process.stderr.write(
+        `${prefix} ${stream}: [stopped echoing at ${outputLimit} bytes of log; the recorded digest still covers every byte the verifier wrote]\n`,
+      );
+      return;
+    }
+    echoed[stream] += Buffer.byteLength(rendered);
+    process.stderr.write(rendered);
+  };
+  const drain = (stream: "stdout" | "stderr"): void => {
+    const rest = pending[stream];
+    pending[stream] = "";
+    if (rest !== "") line(stream, rest);
+  };
+  return {
+    add: (chunk, stream) => {
+      if (stopped[stream]) return;
+      const text = pending[stream] + decoder[stream].write(chunk);
+      const lines = text.split("\n");
+      pending[stream] = lines.pop() ?? "";
+      for (const item of lines) line(stream, item);
+      if (pending[stream].length > 4_000) drain(stream);
+    },
+    flush: () => {
+      drain("stdout");
+      drain("stderr");
+    },
+  };
+}
+
+function unavailableExplanation(reason: PackageUnavailableReason): string {
+  if (reason === "missing")
+    return "No sealed package for this envelope is in the package directory, so no verifier ran. Restore the sealed package, or ask Balladeer to retire the envelope.";
+  if (reason === "digest-changed")
+    return "The sealed package in the repository no longer matches the frozen manifest, so no verifier ran. Activate the re-sealed package with Balladeer.";
+  return "More than one sealed package declares this envelope id, so no verifier ran. Remove the duplicate.";
+}
+
+const summaryLimit = 65_536;
+
+async function appendJobSummary(rows: string[]): Promise<void> {
+  const path = process.env.GITHUB_STEP_SUMMARY;
+  if (!path || rows.length === 0) return;
+  const table = [
+    "### Balladeer continuity attestor",
+    "",
+    "| Envelope | Control | Outcome | Detail |",
+    "| --- | --- | --- | --- |",
+    ...rows,
+    "",
+  ].join("\n");
+  try {
+    await appendFile(path, `${table.slice(0, summaryLimit)}\n`, "utf8");
+  } catch {
+    humanLine("could not write the GitHub job summary; the lines above are the whole report");
+  }
+}
+
+/**
+ * Say what happened, in the customer's own job log, for every envelope the run
+ * covered. This is explanation only: it reads finished results and writes to
+ * the human channel, the GitHub annotation stream, and the job summary. It
+ * never changes a result and never adds a field to what is published.
+ */
+export async function announceRun(
+  selections: ManifestEntrySelection[],
+  results: RunResult[],
+  rejectedPackageFiles: string[] = [],
+): Promise<void> {
+  const cell = (value: string, limit: number): string =>
+    loggable(value, limit).replace(/\|/g, "\\|");
+  const byEnvelope = new Map(selections.map((selection) => [selection.envelopeId, selection]));
+  for (const file of rejectedPackageFiles)
+    humanLine(
+      `a package file was skipped because it is not a valid sealed package: ${loggable(file, 200)}`,
+    );
+  if (results.length === 0) return;
+  humanLine(`${results.length} verifier result(s) across ${selections.length} active envelope(s).`);
+  const rows: string[] = [];
+  for (const result of results) {
+    const selection = byEnvelope.get(result.envelopeId);
+    const pkg = selection?.kind === "package" ? selection.package : undefined;
+    const title = pkg ? loggable(pkg.envelope.title, 160) : "";
+    const promise = pkg ? loggable(pkg.envelope.observableOutcome, 240) : "";
+    const reason = selection?.kind === "unavailable" ? unavailableExplanation(selection.reason) : "";
+    const envelope = loggable(result.envelopeId, 80);
+    const subject = title === "" ? envelope : `${envelope} (${title})`;
+    const detail = reason !== "" ? reason : promise === "" ? "" : `Approved observable outcome: ${promise}`;
+    const sentence = `${subject}: ${result.control} control outcome ${result.outcome}.${detail === "" ? "" : ` ${detail}`}`;
+    humanLine(sentence);
+    annotate(result.outcome === "pass" ? "notice" : "error", sentence);
+    rows.push(
+      `| ${cell(subject, 240)} | ${result.control} | ${result.outcome} | ${cell(detail, 240)} |`,
+    );
+  }
+  await appendJobSummary(rows);
+}
+
 /**
  * Customer verifiers are untrusted processes. They need a minimal operating
  * environment, not the Actions control plane: in particular they must never
@@ -998,8 +1279,18 @@ export async function runVerifier(
   if (!isGitSha(sourceSha)) throw new Error("sourceSha must be an exact 40-hex commit SHA");
   const spec = pkg.verifier[control];
   const started = new Date();
-  if (!(await verifyLockedMaterials(pkg, executionRoot)))
-    return closedResult(pkg, control, started, sourceSha, "custody-invalid", null, "invalid");
+  const custodyInvalid = (): RunResult =>
+    closedResult(
+      pkg.envelope.id,
+      pkg.packageDigest,
+      control,
+      started,
+      sourceSha,
+      "custody-invalid",
+      null,
+      "invalid",
+    );
+  if (!(await verifyLockedMaterials(pkg, executionRoot))) return custodyInvalid();
   const timeout = spec.timeoutMs ?? 120_000;
   let root: string;
   let cwd: string;
@@ -1007,14 +1298,14 @@ export async function runVerifier(
     root = await realpath(executionRoot);
     cwd = await realpath(pathResolve(root, spec.cwd ?? "."));
   } catch {
-    return closedResult(pkg, control, started, sourceSha, "custody-invalid", null, "invalid");
+    return custodyInvalid();
   }
   const relativeCwd = relative(root, cwd);
   if (relativeCwd.startsWith("..") || isAbsolute(relativeCwd)) {
-    return closedResult(pkg, control, started, sourceSha, "custody-invalid", null, "invalid");
+    return custodyInvalid();
   }
   return new Promise((settle) => {
-    const outputLimit = 1_048_576;
+    const echo = outputEcho(pkg.envelope.id, control);
     let stdoutBytes = 0;
     let stderrBytes = 0;
     const stdoutHash = createHash("sha256");
@@ -1059,6 +1350,10 @@ export async function runVerifier(
         stderrHash.update(chunk);
         if (stderrBytes > outputLimit) stop("unknown");
       }
+      // The digest above covers every raw byte. The echo below is a bounded,
+      // sanitized copy for the customer's own job log and changes nothing that
+      // is published.
+      echo.add(chunk, stream);
     };
     child.stdout.on("data", (chunk: Buffer) => updateOutput(chunk, "stdout"));
     child.stderr.on("data", (chunk: Buffer) => updateOutput(chunk, "stderr"));
@@ -1068,6 +1363,7 @@ export async function runVerifier(
       settled = true;
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      echo.flush();
       const completed = new Date();
       const base: Omit<RunResult, "resultDigest"> = {
         schemaVersion: RUNNER_SCHEMA,
@@ -1107,8 +1403,16 @@ export async function runVerifier(
     });
   });
 }
+/**
+ * A result reached without running a verifier. It is addressed by envelope id
+ * and package digest rather than by a package object, because the manifest can
+ * name an envelope whose sealed package is missing, re-sealed, or ambiguous:
+ * that entry still owes the control plane exactly one closed result, carrying
+ * the digest the frozen manifest expected.
+ */
 function closedResult(
-  pkg: AcceptancePackage,
+  envelopeId: string,
+  packageDigest: string,
   control: RunMode,
   started: Date,
   sourceSha: string,
@@ -1120,8 +1424,8 @@ function closedResult(
   const base: Omit<RunResult, "resultDigest"> = {
     schemaVersion: RUNNER_SCHEMA,
     runnerVersion: RUNNER_VERSION,
-    envelopeId: pkg.envelope.id,
-    packageDigest: pkg.packageDigest,
+    envelopeId,
+    packageDigest,
     sourceSha,
     control,
     outcome,

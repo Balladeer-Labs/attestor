@@ -55,6 +55,21 @@ For the exact candidate SHA, review or exercise every applicable category:
 - **Bounded execution:** confirm controls and envelopes run serially, verifier processes
   are time-bounded, every job has a wall-clock timeout, and every authored HTTP request
   has connection and total timeouts.
+- **Customer-log output:** confirm verifier stdout and stderr reach the customer's own job
+  log and nothing else. Inspect the published artifact and HTTP bodies for echoed text;
+  they must still carry only normalized outcomes and digests. Exercise a verifier that
+  emits `::error::`, `::stop-commands::`, ANSI escapes, carriage returns, and more than
+  1 MiB on each stream: every line must appear behind the fixed prefix, no line may be
+  parsed by GitHub as a workflow command, and the echo must stop at the byte bound while
+  the digest still covers every byte. Confirm no control-plane response content is printed
+  beyond bounded envelope ids.
+- **Per-package isolation:** confirm one missing, re-sealed, ambiguous, or unreadable
+  package yields exactly one custody-invalid result for that envelope while every other
+  envelope still runs and publishes. Confirm the result count still equals the frozen
+  manifest's envelope count, that the custody-invalid result carries the digest the
+  manifest expected, that no verifier ran for it, and that the advisory check still fails
+  when any result is not a pass. Isolation must never let a run execute a package the
+  manifest did not name.
 - **Protocol binding and replay:** exercise a good run plus wrong repository/owner IDs,
   wrong caller ref or workflow, wrong target/source SHA, stale or reused challenge,
   mismatched manifest/package digests, incomplete results, and a revoked attestor release.

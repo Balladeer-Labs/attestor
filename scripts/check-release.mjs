@@ -60,6 +60,7 @@ const runner = contents.get("packages/continuity-runner/src/index.ts");
 const runnerCli = contents.get("packages/continuity-runner/src/cli.ts");
 const readme = contents.get("README.md");
 const security = contents.get("SECURITY.md");
+const trustBoundary = contents.get("TRUST-BOUNDARY.md");
 const securityReview = contents.get("SECURITY-REVIEW.md");
 const claude = contents.get("CLAUDE.md");
 const license = contents.get("LICENSE");
@@ -196,6 +197,28 @@ const assertions = [
       runner.includes("assertExactMaterialClosure") &&
       runner.includes("envelope material tree contains a symbolic link"),
     "closed envelope-owned material tree",
+  ],
+  [
+    !runner.includes("process.stdout") && !runner.includes("console."),
+    "the closed result is the only thing the runner writes to stdout",
+  ],
+  [
+    runner.includes("function outputEcho(") &&
+      runner.includes("humanPrefix") &&
+      runner.includes("controlCharacter"),
+    "echoed verifier output is prefixed and stripped of control characters",
+  ],
+  [
+    runner.includes("export function selectManifestEntries") &&
+      !runner.includes("selectManifestPackages") &&
+      runnerCli.includes("selectManifestEntries") &&
+      runnerCli.includes("readAvailablePackages"),
+    "one manifest entry yields exactly one custody answer",
+  ],
+  [
+    security.includes("customer's own GitHub job log") &&
+      trustBoundary.includes("customer's own GitHub job log"),
+    "verifier output is documented as customer-local",
   ],
   [packageJson.private === false, "release package is public"],
   [packageJson.license === "Apache-2.0", "Apache-2.0 package license"],

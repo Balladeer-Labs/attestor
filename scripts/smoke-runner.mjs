@@ -19,19 +19,45 @@ import {
 
 const root = await mkdtemp(join(tmpdir(), "balladeer-attestor-smoke-"));
 const sourceSha = "a".repeat(40);
+// The verifier writes on both streams as soon as it starts and exits later, so
+// the digests and the echoed log lines are the same on every run.
+const verifierStdout = "raw customer output\n";
+const verifierStderr = "customer diagnostic line\n";
 const verifierSource = `import { closeSync, openSync, unlinkSync } from "node:fs";
 const mode = process.argv[2];
 const lock = ".continuity-shared-smoke.lock";
 let descriptor;
 try { descriptor = openSync(lock, "wx"); }
 catch { process.exit(9); }
+process.stdout.write(${JSON.stringify(verifierStdout)});
+process.stderr.write(${JSON.stringify(verifierStderr)});
 setTimeout(() => {
   closeSync(descriptor);
   unlinkSync(lock);
-  process.stdout.write("raw customer output");
   process.exit(mode === "bad" ? 1 : 0);
 }, 150);
 `;
+
+// Exactly the fields a published result may carry. A new field would widen what
+// leaves customer CI, so the shape is asserted here rather than left to the
+// receiving schema.
+const publishedResultKeys = [
+  "completedAt",
+  "control",
+  "custody",
+  "durationMs",
+  "envelopeId",
+  "exitCode",
+  "outcome",
+  "packageDigest",
+  "resultDigest",
+  "runnerVersion",
+  "schemaVersion",
+  "sourceSha",
+  "startedAt",
+  "stderrDigest",
+  "stdoutDigest",
+];
 
 const meaningFor = (label) => ({
   title: `${label} creates one order`,
@@ -101,6 +127,9 @@ try {
   assert.equal(target.custody, "local");
   assert.equal("stdout" in target, false);
   assert.match(target.stdoutDigest, /^sha256:[a-f0-9]{64}$/);
+  // The digest covers exactly the raw verifier bytes, whatever the log shows.
+  assert.equal(target.stdoutDigest, sha256(verifierStdout));
+  assert.equal(target.stderrDigest, sha256(verifierStderr));
 
   const controls = await runAll(pkg, root, sourceSha);
   assert.deepEqual(
@@ -176,6 +205,140 @@ try {
     ["good", "bad", "refactor"].map((control) => qualification.controls[control].outcome),
     ["pass", "fail", "pass"],
   );
+
+  // A customer who reads a red check must find words next to it. The runner
+  // echoes each verifier's own stdout and stderr, an annotation, and a job
+  // summary into the customer's GitHub job log, while standard output still
+  // carries nothing but the closed result the publisher sends on.
+  const cliPath = new URL("../release/continuity-runner/cli.js", import.meta.url).pathname;
+  const packagesDirectory = join(root, ".continuity/packages");
+  await mkdir(packagesDirectory, { recursive: true });
+  const writeSealedPackage = (item) =>
+    writeFile(
+      join(packagesDirectory, `${item.envelope.id}.json`),
+      JSON.stringify(item, null, 2) + "\n",
+    );
+  const writeManifest = async (name, envelopes) => {
+    const base = {
+      schemaVersion: "continuity-ci/v1",
+      targetId: "target-smoke",
+      generatedAt: "2026-09-02T00:00:00.000Z",
+      envelopes,
+    };
+    const path = join(root, name);
+    await writeFile(path, JSON.stringify({ ...base, manifestDigest: sha256(canonicalize(base)) }));
+    return path;
+  };
+  const summaryPath = join(root, "step-summary.md");
+  const runManifestTarget = (manifestPath) =>
+    spawnSync(
+      process.execPath,
+      [cliPath, "run-manifest-target", ".continuity/packages", manifestPath],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          BALLADEER_SOURCE_SHA: sourceSha,
+          GITHUB_ACTIONS: "true",
+          GITHUB_STEP_SUMMARY: summaryPath,
+        },
+      },
+    );
+
+  await writeSealedPackage(pkg);
+  await writeSealedPackage(second);
+  await writeFile(summaryPath, "");
+  const activeManifestPath = await writeManifest("manifest-active.json", [
+    { id: pkg.envelope.id, packageDigest: pkg.packageDigest },
+    { id: second.envelope.id, packageDigest: second.packageDigest },
+  ]);
+
+  const visible = runManifestTarget(activeManifestPath);
+  assert.equal(visible.status, 0, visible.stderr);
+  assert.equal(
+    visible.stdout.includes(verifierStdout.trim()),
+    false,
+    "standard output is the published channel and must not carry verifier output",
+  );
+  assert.equal(
+    visible.stdout.includes(verifierStderr.trim()),
+    false,
+    "standard output is the published channel and must not carry verifier output",
+  );
+  const visibleOutput = JSON.parse(visible.stdout);
+  assert.equal(visibleOutput.results.length, 2);
+  for (const result of visibleOutput.results) {
+    assert.deepEqual(Object.keys(result).sort(), publishedResultKeys);
+    assert.equal(result.outcome, "pass");
+  }
+  assert.equal(visibleOutput.results[0].stdoutDigest, sha256(verifierStdout));
+  assert.equal(visibleOutput.results[0].stderrDigest, sha256(verifierStderr));
+  assert.match(visible.stderr, /\[balladeer\] env_attestorsmoke target stdout: raw customer output/);
+  assert.match(
+    visible.stderr,
+    /\[balladeer\] env_attestorsmoke target stderr: customer diagnostic line/,
+  );
+  assert.match(
+    visible.stderr,
+    /::notice::env_attestorsmoke \(Checkout creates one order\): target control outcome pass\./,
+  );
+  assert.match(visible.stderr, /Approved observable outcome: Exactly one order is created/);
+  const summary = await readFile(summaryPath, "utf8");
+  assert.match(summary, /\| env_attestorsmoke \(Checkout creates one order\) \| target \| pass \|/);
+  assert.match(summary, /Exactly one order is created/);
+
+  // One re-sealed package must not blank the catalog. Every manifest entry
+  // still owes exactly one result, the re-sealed envelope alone is
+  // custody-invalid, and the healthy envelope still runs.
+  await writeFile(join(root, ".continuity/envelopes/env_attestorother/fixture.json"), '{"case":"Renewal v2"}\n');
+  const resealed = await sealPackageDraft(
+    {
+      schemaVersion: second.schemaVersion,
+      envelope: second.envelope,
+      verifier: second.verifier,
+      materials: second.materials.map(({ path, kind }) => ({ path, kind })),
+    },
+    root,
+  );
+  assert.notEqual(resealed.packageDigest, second.packageDigest);
+  await writeSealedPackage(resealed);
+  const isolated = runManifestTarget(activeManifestPath);
+  assert.equal(isolated.status, 0, isolated.stderr);
+  const isolatedResults = JSON.parse(isolated.stdout).results;
+  assert.equal(isolatedResults.length, 2, "manifest cardinality must survive a re-sealed package");
+  assert.deepEqual(
+    isolatedResults.map((result) => [result.envelopeId, result.outcome]),
+    [
+      [pkg.envelope.id, "pass"],
+      [second.envelope.id, "custody-invalid"],
+    ],
+  );
+  assert.equal(isolatedResults[1].custody, "invalid");
+  assert.equal(isolatedResults[1].exitCode, null);
+  // The result carries the digest the frozen manifest expected, not the one now
+  // on disk, and no verifier ran for it.
+  assert.equal(isolatedResults[1].packageDigest, second.packageDigest);
+  assert.equal(isolatedResults[1].stdoutDigest, sha256(""));
+  assert.match(isolated.stderr, /no longer matches the frozen manifest/);
+
+  // A missing package and an unreadable package file behave the same way: that
+  // envelope alone is custody-invalid.
+  await unlink(join(packagesDirectory, `${second.envelope.id}.json`));
+  await writeFile(join(packagesDirectory, "not-a-sealed-package.json"), "{ not json");
+  const missing = runManifestTarget(activeManifestPath);
+  assert.equal(missing.status, 0, missing.stderr);
+  const missingResults = JSON.parse(missing.stdout).results;
+  assert.deepEqual(
+    missingResults.map((result) => [result.envelopeId, result.outcome]),
+    [
+      [pkg.envelope.id, "pass"],
+      [second.envelope.id, "custody-invalid"],
+    ],
+  );
+  assert.match(missing.stderr, /No sealed package for this envelope is in the package directory/);
+  assert.match(missing.stderr, /not a valid sealed package: .*not-a-sealed-package\.json/);
+  assert.match(missing.stderr, /::error::env_attestorother: target control outcome custody-invalid/);
 
   const envelopeRoot = join(root, ".continuity/envelopes/env_attestorsmoke");
   const undeclaredPath = join(envelopeRoot, "undeclared-helper.mjs");
