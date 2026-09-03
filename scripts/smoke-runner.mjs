@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   assertPackageReady,
+  buildQualificationRequest,
   canonicalize,
   packageDigest,
   runAll,
@@ -124,6 +125,57 @@ try {
   };
   assert.equal((await sealPackageDraft(draft, root)).packageDigest, pkg.packageDigest);
   await assertPackageReady(pkg, root);
+
+  // The published receipt carries exactly the bounded control pair for every
+  // control, including tamper. A control that leaks an extra field (an
+  // envelope id, a path, raw output) widens what leaves customer CI, so the
+  // shape is asserted here rather than left to the receiving schema.
+  Object.assign(process.env, {
+    GITHUB_REPOSITORY: "owner-smoke/repository-smoke",
+    GITHUB_REPOSITORY_ID: "1234567",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_WORKFLOW: "continuity",
+    GITHUB_WORKFLOW_REF:
+      "owner-smoke/repository-smoke/.github/workflows/continuity.yml@refs/heads/main",
+    GITHUB_WORKFLOW_SHA: "b".repeat(40),
+    GITHUB_RUN_ID: "42",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_EVENT_NAME: "push",
+    GITHUB_SHA: sourceSha,
+  });
+  const qualification = await buildQualificationRequest(
+    pkg,
+    {
+      schemaVersion: "continuity-qualification-meta/v1",
+      workspaceLocator: "3f1d9c2a-5b64-4a7e-9c31-8d2f6a0b4e57",
+      receiptId: "7c8e1b40-2d95-4f16-a3b8-51c7e9d0af62",
+      revisionId: "rev_smoke001",
+      bindingId: "bind_smoke001",
+      workflowDigest: sha256("smoke-workflow"),
+    },
+    root,
+  );
+  assert.deepEqual(Object.keys(qualification.controls).sort(), [
+    "bad",
+    "good",
+    "refactor",
+    "tamper",
+  ]);
+  for (const [control, published] of Object.entries(qualification.controls)) {
+    assert.deepEqual(
+      Object.keys(published).sort(),
+      ["outcome", "resultDigest"],
+      `qualification control ${control} must publish exactly outcome and resultDigest`,
+    );
+    assert.match(published.resultDigest, /^sha256:[a-f0-9]{64}$/);
+  }
+  assert.equal(qualification.controls.tamper.outcome, "detected");
+  // `bad` is published as the observed behavior, so a correctly caught
+  // known-bad case is reported as `fail`, not as the local control's `pass`.
+  assert.deepEqual(
+    ["good", "bad", "refactor"].map((control) => qualification.controls[control].outcome),
+    ["pass", "fail", "pass"],
+  );
 
   const envelopeRoot = join(root, ".continuity/envelopes/env_attestorsmoke");
   const undeclaredPath = join(envelopeRoot, "undeclared-helper.mjs");

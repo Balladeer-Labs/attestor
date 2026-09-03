@@ -659,7 +659,14 @@ export async function buildQualificationRequest(
   const metadata = githubQualificationMetadata(validateQualificationMetadata(metadataInput));
   const results = await runAll(pkg, executionRoot, metadata.sourceSha);
   const byControl = new Map(results.map((result) => [result.control, result]));
-  const tamper = await runTamperControl(pkg, executionRoot, metadata.sourceSha);
+  const tamperControl = await runTamperControl(pkg, executionRoot, metadata.sourceSha);
+  // Every published control is the same closed pair. The tamper control's
+  // local result also carries the envelope id, which the receipt already
+  // binds through packageDigest and semanticDigest, so it is projected to
+  // { outcome, resultDigest } like good/bad/refactor rather than sent whole.
+  // The tamper detection semantics are unchanged; only the published shape is
+  // narrowed.
+  const tamper = { outcome: tamperControl.outcome, resultDigest: tamperControl.resultDigest };
   const result = (control: Control) => {
     const item = byControl.get(control);
     if (!item) throw new Error(`qualification result is missing ${control}`);
