@@ -27,12 +27,12 @@ copy those things here to make a test pass.
 - The control-plane origin and OIDC audience stay fixed at
   `https://attest.balladeer.ai`. They are not inputs, variables, or secrets.
 - There is no caller-supplied setup hook. Preparation that determines how a promise is
-  asserted belongs in the envelope-owned, digest-locked material tree.
+  asserted belongs in the promise-owned, digest-locked material tree.
 - Source-reading jobs cannot mint OIDC. Token-bearing jobs cannot check out customer
   source and receive only closed result JSON. Do not collapse these jobs.
 - All third-party actions use full 40-character commit SHAs. GitHub runner images,
   Node, network calls, jobs, and verifier processes remain explicitly bounded.
-- Controls and envelopes run serially unless a future security review proves that
+- Controls and promises run serially unless a future security review proves that
   concurrency preserves isolation and deterministic custody.
 - `release/continuity-runner` must reproduce byte-for-byte from the reviewed TypeScript.
   Never hand-edit generated JavaScript or build/install the attestor in customer CI.

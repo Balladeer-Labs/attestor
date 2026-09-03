@@ -88,7 +88,7 @@ try {
     const mode = command === "run-manifest-target" ? "target" : "exercise";
     // One missing, re-sealed, or unreadable package must not blank the catalog.
     // Read what is readable, resolve every manifest entry on its own, and let
-    // the envelopes that are fine still run.
+    // the promises that are fine still run.
     const { packages: available, rejected } = await readAvailablePackages(packagePath);
     const selections = selectManifestEntries(available, manifest);
     const results = await runManifestEntries(selections, mode);
@@ -137,7 +137,7 @@ try {
       // it, so a red check is never wordless.
       const selections: ManifestEntrySelection[] = packages.map((item) => ({
         kind: "package",
-        envelopeId: item.envelope.id,
+        promiseId: item.promise.id,
         package: item,
       }));
       await announceRun(selections, results);

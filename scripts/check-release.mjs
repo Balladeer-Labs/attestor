@@ -77,6 +77,23 @@ const actionLines = [...workflow.split("\n"), ...integrityWorkflow.split("\n")].
   /\buses:\s/.test(line),
 );
 const allText = [...contents.values()].join("\n");
+
+// The product's noun is `promise`. The retired noun must survive nowhere in
+// this tree: not in a path, an identifier, a protocol field, a fixture, or a
+// sentence a customer reads. Three places still have to name it: the runner's
+// refusal for a package written against the old shape, the smoke test that
+// exercises that refusal, and this check. Each assembles it from fragments the
+// way this line does, so that naming it cannot defeat the check.
+const retiredNoun = ["envel", "ope"].join("");
+const retiredNounPattern = new RegExp(`\\b${retiredNoun}s?\\b`, "i");
+const retiredNounFiles = files.filter(
+  (file) => retiredNounPattern.test(file) || retiredNounPattern.test(contents.get(file)),
+);
+// The private control plane's legacy provider hostname, which must never be
+// published here. Renaming the product's noun does not rename a hostname that
+// already exists, so this check still looks for the original spelling.
+const legacyProviderHost = `balladeer-${retiredNoun}s.fly.dev`;
+
 const secretPatterns = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/,
@@ -106,7 +123,17 @@ const assertions = [
   [controlPlaneMatches[0]?.[1] === "https://attest.balladeer.ai", "stable CI origin"],
   [audienceMatches.length === 1, "one OIDC audience constant"],
   [audienceMatches[0]?.[1] === "https://attest.balladeer.ai", "fixed OIDC audience"],
-  [!allText.includes(["balladeer-envelopes", "fly.dev"].join(".")), "no provider hostname"],
+  [!allText.includes(legacyProviderHost), "no provider hostname"],
+  [
+    retiredNounFiles.length === 0,
+    `the retired noun appears nowhere in the tree (${retiredNounFiles.join(", ") || "none"})`,
+  ],
+  [
+    runner.includes("retiredNoun") &&
+      runner.includes("retiredShapeError") &&
+      runner.includes("never migrated in place"),
+    "the retired package shape is refused by name",
+  ],
   [!allText.includes(["control.balladeer", "invalid"].join(".")), "no placeholder origin"],
   [!/^\s+(control_plane_url|balladeer_url|oidc_audience):/m.test(workflow), "no caller endpoint inputs"],
   [
@@ -193,10 +220,10 @@ const assertions = [
     "verifier controls and packages execute serially",
   ],
   [
-    runner.includes(".continuity/envelopes/${envelopeId}") &&
+    runner.includes(".continuity/promises/${promiseId}") &&
       runner.includes("assertExactMaterialClosure") &&
-      runner.includes("envelope material tree contains a symbolic link"),
-    "closed envelope-owned material tree",
+      runner.includes("promise material tree contains a symbolic link"),
+    "closed promise-owned material tree",
   ],
   [
     !runner.includes("process.stdout") && !runner.includes("console."),

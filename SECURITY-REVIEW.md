@@ -45,14 +45,14 @@ For the exact candidate SHA, review or exercise every applicable category:
   confirm every third-party action is full-SHA pinned, confirm the exact Node and Ubuntu
   versions, and confirm customer CI performs no attestor install or compilation.
 - **Verifier custody:** reject missing, extra, changed, symlinked, special, escaping, or
-  duplicate envelope material. Confirm verifier entrypoints stay inside the declared
-  envelope tree, all regular files in that tree are declared and digest-locked, and
+  duplicate promise material. Confirm verifier entrypoints stay inside the declared
+  promise tree, all regular files in that tree are declared and digest-locked, and
   assertion-defining helpers cannot hide outside it. Product code used as the system
   under test may remain outside the custody claim.
 - **Setup-hook poisoning:** confirm no free-form setup command or equivalent pre-verifier
   execution surface exists. Preparation that determines the assertion must be declared
   package material.
-- **Bounded execution:** confirm controls and envelopes run serially, verifier processes
+- **Bounded execution:** confirm controls and promises run serially, verifier processes
   are time-bounded, every job has a wall-clock timeout, and every authored HTTP request
   has connection and total timeouts.
 - **Customer-log output:** confirm verifier stdout and stderr reach the customer's own job
@@ -62,11 +62,11 @@ For the exact candidate SHA, review or exercise every applicable category:
   1 MiB on each stream: every line must appear behind the fixed prefix, no line may be
   parsed by GitHub as a workflow command, and the echo must stop at the byte bound while
   the digest still covers every byte. Confirm no control-plane response content is printed
-  beyond bounded envelope ids.
+  beyond bounded promise ids.
 - **Per-package isolation:** confirm one missing, re-sealed, ambiguous, or unreadable
-  package yields exactly one custody-invalid result for that envelope while every other
-  envelope still runs and publishes. Confirm the result count still equals the frozen
-  manifest's envelope count, that the custody-invalid result carries the digest the
+  package yields exactly one custody-invalid result for that promise while every other
+  promise still runs and publishes. Confirm the result count still equals the frozen
+  manifest's promise count, that the custody-invalid result carries the digest the
   manifest expected, that no verifier ran for it, and that the advisory check still fails
   when any result is not a pass. Isolation must never let a run execute a package the
   manifest did not name.

@@ -14,6 +14,7 @@ import {
   runTargetPackages,
   sealPackageDraft,
   sha256,
+  validateExecutionManifest,
   validatePackage,
 } from "../release/continuity-runner/index.js";
 
@@ -46,10 +47,10 @@ const publishedResultKeys = [
   "control",
   "custody",
   "durationMs",
-  "envelopeId",
   "exitCode",
   "outcome",
   "packageDigest",
+  "promiseId",
   "resultDigest",
   "runnerVersion",
   "schemaVersion",
@@ -79,19 +80,19 @@ const meaningFor = (label) => ({
   scope: { repositoryId: "repository-smoke", surfaces: ["checkout"], labels: [] },
 });
 
-async function createPackage(envelopeId, label) {
-  const envelopeRoot = `.continuity/envelopes/${envelopeId}`;
-  const verifierPath = `${envelopeRoot}/verifier.mjs`;
-  const fixturePath = `${envelopeRoot}/fixture.json`;
-  await mkdir(join(root, envelopeRoot), { recursive: true });
+async function createPackage(promiseId, label) {
+  const promiseRoot = `.continuity/promises/${promiseId}`;
+  const verifierPath = `${promiseRoot}/verifier.mjs`;
+  const fixturePath = `${promiseRoot}/fixture.json`;
+  await mkdir(join(root, promiseRoot), { recursive: true });
   await writeFile(join(root, verifierPath), verifierSource);
   await writeFile(join(root, fixturePath), `{"case":"${label}"}\n`);
   const meaning = meaningFor(label);
   const command = (mode) => ({ executable: process.execPath, args: [verifierPath, mode] });
   const base = {
     schemaVersion: "continuity-package/v1",
-    envelope: {
-      id: envelopeId,
+    promise: {
+      id: promiseId,
       semanticDigest: sha256(canonicalize(meaning)),
       ownerId: "owner-smoke",
       ...meaning,
@@ -119,8 +120,8 @@ async function createPackage(envelopeId, label) {
 }
 
 try {
-  const pkg = await createPackage("env_attestorsmoke", "Checkout");
-  const second = await createPackage("env_attestorother", "Renewal");
+  const pkg = await createPackage("prom_attestorsmoke", "Checkout");
+  const second = await createPackage("prom_attestorother", "Renewal");
 
   const target = await runTarget(pkg, root, sourceSha);
   assert.equal(target.outcome, "pass");
@@ -148,7 +149,7 @@ try {
 
   const draft = {
     schemaVersion: pkg.schemaVersion,
-    envelope: pkg.envelope,
+    promise: pkg.promise,
     verifier: pkg.verifier,
     materials: pkg.materials.map(({ path, kind }) => ({ path, kind })),
   };
@@ -156,8 +157,8 @@ try {
   await assertPackageReady(pkg, root);
 
   // The published receipt carries exactly the bounded control pair for every
-  // control, including tamper. A control that leaks an extra field (an
-  // envelope id, a path, raw output) widens what leaves customer CI, so the
+  // control, including tamper. A control that leaks an extra field (a
+  // promise id, a path, raw output) widens what leaves customer CI, so the
   // shape is asserted here rather than left to the receiving schema.
   Object.assign(process.env, {
     GITHUB_REPOSITORY: "owner-smoke/repository-smoke",
@@ -215,15 +216,15 @@ try {
   await mkdir(packagesDirectory, { recursive: true });
   const writeSealedPackage = (item) =>
     writeFile(
-      join(packagesDirectory, `${item.envelope.id}.json`),
+      join(packagesDirectory, `${item.promise.id}.json`),
       JSON.stringify(item, null, 2) + "\n",
     );
-  const writeManifest = async (name, envelopes) => {
+  const writeManifest = async (name, promises) => {
     const base = {
       schemaVersion: "continuity-ci/v1",
       targetId: "target-smoke",
       generatedAt: "2026-09-02T00:00:00.000Z",
-      envelopes,
+      promises,
     };
     const path = join(root, name);
     await writeFile(path, JSON.stringify({ ...base, manifestDigest: sha256(canonicalize(base)) }));
@@ -250,8 +251,8 @@ try {
   await writeSealedPackage(second);
   await writeFile(summaryPath, "");
   const activeManifestPath = await writeManifest("manifest-active.json", [
-    { id: pkg.envelope.id, packageDigest: pkg.packageDigest },
-    { id: second.envelope.id, packageDigest: second.packageDigest },
+    { id: pkg.promise.id, packageDigest: pkg.packageDigest },
+    { id: second.promise.id, packageDigest: second.packageDigest },
   ]);
 
   const visible = runManifestTarget(activeManifestPath);
@@ -274,28 +275,28 @@ try {
   }
   assert.equal(visibleOutput.results[0].stdoutDigest, sha256(verifierStdout));
   assert.equal(visibleOutput.results[0].stderrDigest, sha256(verifierStderr));
-  assert.match(visible.stderr, /\[balladeer\] env_attestorsmoke target stdout: raw customer output/);
+  assert.match(visible.stderr, /\[balladeer\] prom_attestorsmoke target stdout: raw customer output/);
   assert.match(
     visible.stderr,
-    /\[balladeer\] env_attestorsmoke target stderr: customer diagnostic line/,
+    /\[balladeer\] prom_attestorsmoke target stderr: customer diagnostic line/,
   );
   assert.match(
     visible.stderr,
-    /::notice::env_attestorsmoke \(Checkout creates one order\): target control outcome pass\./,
+    /::notice::prom_attestorsmoke \(Checkout creates one order\): target control outcome pass\./,
   );
   assert.match(visible.stderr, /Approved observable outcome: Exactly one order is created/);
   const summary = await readFile(summaryPath, "utf8");
-  assert.match(summary, /\| env_attestorsmoke \(Checkout creates one order\) \| target \| pass \|/);
+  assert.match(summary, /\| prom_attestorsmoke \(Checkout creates one order\) \| target \| pass \|/);
   assert.match(summary, /Exactly one order is created/);
 
   // One re-sealed package must not blank the catalog. Every manifest entry
-  // still owes exactly one result, the re-sealed envelope alone is
-  // custody-invalid, and the healthy envelope still runs.
-  await writeFile(join(root, ".continuity/envelopes/env_attestorother/fixture.json"), '{"case":"Renewal v2"}\n');
+  // still owes exactly one result, the re-sealed promise alone is
+  // custody-invalid, and the healthy promise still runs.
+  await writeFile(join(root, ".continuity/promises/prom_attestorother/fixture.json"), '{"case":"Renewal v2"}\n');
   const resealed = await sealPackageDraft(
     {
       schemaVersion: second.schemaVersion,
-      envelope: second.envelope,
+      promise: second.promise,
       verifier: second.verifier,
       materials: second.materials.map(({ path, kind }) => ({ path, kind })),
     },
@@ -308,10 +309,10 @@ try {
   const isolatedResults = JSON.parse(isolated.stdout).results;
   assert.equal(isolatedResults.length, 2, "manifest cardinality must survive a re-sealed package");
   assert.deepEqual(
-    isolatedResults.map((result) => [result.envelopeId, result.outcome]),
+    isolatedResults.map((result) => [result.promiseId, result.outcome]),
     [
-      [pkg.envelope.id, "pass"],
-      [second.envelope.id, "custody-invalid"],
+      [pkg.promise.id, "pass"],
+      [second.promise.id, "custody-invalid"],
     ],
   );
   assert.equal(isolatedResults[1].custody, "invalid");
@@ -323,52 +324,103 @@ try {
   assert.match(isolated.stderr, /no longer matches the frozen manifest/);
 
   // A missing package and an unreadable package file behave the same way: that
-  // envelope alone is custody-invalid.
-  await unlink(join(packagesDirectory, `${second.envelope.id}.json`));
+  // promise alone is custody-invalid.
+  await unlink(join(packagesDirectory, `${second.promise.id}.json`));
   await writeFile(join(packagesDirectory, "not-a-sealed-package.json"), "{ not json");
   const missing = runManifestTarget(activeManifestPath);
   assert.equal(missing.status, 0, missing.stderr);
   const missingResults = JSON.parse(missing.stdout).results;
   assert.deepEqual(
-    missingResults.map((result) => [result.envelopeId, result.outcome]),
+    missingResults.map((result) => [result.promiseId, result.outcome]),
     [
-      [pkg.envelope.id, "pass"],
-      [second.envelope.id, "custody-invalid"],
+      [pkg.promise.id, "pass"],
+      [second.promise.id, "custody-invalid"],
     ],
   );
-  assert.match(missing.stderr, /No sealed package for this envelope is in the package directory/);
+  assert.match(missing.stderr, /No sealed package for this promise is in the package directory/);
   assert.match(missing.stderr, /not a valid sealed package: .*not-a-sealed-package\.json/);
-  assert.match(missing.stderr, /::error::env_attestorother: target control outcome custody-invalid/);
+  assert.match(missing.stderr, /::error::prom_attestorother: target control outcome custody-invalid/);
 
-  const envelopeRoot = join(root, ".continuity/envelopes/env_attestorsmoke");
-  const undeclaredPath = join(envelopeRoot, "undeclared-helper.mjs");
+  const promiseRoot = join(root, ".continuity/promises/prom_attestorsmoke");
+  const undeclaredPath = join(promiseRoot, "undeclared-helper.mjs");
   await writeFile(undeclaredPath, "export default true;\n");
   assert.equal((await runTarget(pkg, root, sourceSha)).outcome, "custody-invalid");
   await assert.rejects(sealPackageDraft(draft, root), /material closure mismatch/);
   await assert.rejects(assertPackageReady(pkg, root), /material closure mismatch/);
   await unlink(undeclaredPath);
 
-  const linkPath = join(envelopeRoot, "fixture-link.json");
+  const linkPath = join(promiseRoot, "fixture-link.json");
   await symlink("fixture.json", linkPath);
   assert.equal((await runTarget(pkg, root, sourceSha)).outcome, "custody-invalid");
   await unlink(linkPath);
 
-  const fixturePath = join(envelopeRoot, "fixture.json");
+  const fixturePath = join(promiseRoot, "fixture.json");
   await writeFile(fixturePath, '{"case":"tampered"}\n');
   const custodyFailure = await runTarget(pkg, root, sourceSha);
   assert.equal(custodyFailure.outcome, "custody-invalid");
   assert.equal(custodyFailure.custody, "invalid");
 
   const escaped = structuredClone(pkg);
-  escaped.materials[0].path = ".continuity/envelopes/env_attestorother/verifier.mjs";
+  escaped.materials[0].path = ".continuity/promises/prom_attestorother/verifier.mjs";
   escaped.packageDigest = packageDigest(escaped);
   assert.throws(() => validatePackage(escaped), /must be inside/);
+
+  // A package written against the retired noun is refused by name rather than
+  // with a generic unknown-field error, so whoever reads the job log is told
+  // what happened. The retired word is assembled from fragments here for the
+  // same reason it is in the runner: the release check asserts it survives
+  // nowhere in this tree.
+  const retiredNoun = ["envel", "ope"].join("");
+  const refusesRetiredShape = new RegExp(
+    `uses the retired ${retiredNoun} naming.*never migrated in place`,
+  );
+  assert.throws(
+    () =>
+      validatePackage({
+        schemaVersion: pkg.schemaVersion,
+        [retiredNoun]: pkg.promise,
+        verifier: pkg.verifier,
+        materials: pkg.materials,
+        packageDigest: pkg.packageDigest,
+      }),
+    refusesRetiredShape,
+  );
+  const retiredIdPackage = structuredClone(pkg);
+  retiredIdPackage.promise.id = "env_attestorsmoke";
+  retiredIdPackage.packageDigest = packageDigest(retiredIdPackage);
+  assert.throws(() => validatePackage(retiredIdPackage), refusesRetiredShape);
+  await assert.rejects(
+    sealPackageDraft(
+      {
+        schemaVersion: draft.schemaVersion,
+        [retiredNoun]: draft.promise,
+        verifier: draft.verifier,
+        materials: draft.materials,
+      },
+      root,
+    ),
+    refusesRetiredShape,
+  );
+  const retiredManifestBase = {
+    schemaVersion: "continuity-ci/v1",
+    targetId: "target-smoke",
+    generatedAt: "2026-09-02T00:00:00.000Z",
+    [`${retiredNoun}s`]: [{ id: pkg.promise.id, packageDigest: pkg.packageDigest }],
+  };
+  assert.throws(
+    () =>
+      validateExecutionManifest({
+        ...retiredManifestBase,
+        manifestDigest: sha256(canonicalize(retiredManifestBase)),
+      }),
+    refusesRetiredShape,
+  );
 
   const emptyManifestBase = {
     schemaVersion: "continuity-ci/v1",
     targetId: "target-smoke",
     generatedAt: "2026-09-02T00:00:00.000Z",
-    envelopes: [],
+    promises: [],
   };
   const emptyManifestPath = join(root, "empty-manifest.json");
   await writeFile(

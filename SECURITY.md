@@ -27,23 +27,23 @@ custody guarantee is designed to catch accidental changes and ordinary agent tam
 customers remain responsible for their verifier code and GitHub runner policy.
 
 There is no caller-supplied setup command. Verifier preparation must live in the
-envelope-owned `.continuity/envelopes/<envelope-id>/` tree. The package must enumerate
+promise-owned `.continuity/promises/<promise-id>/` tree. The package must enumerate
 every regular file in that tree, symbolic links and special files are rejected, and every
 declared byte is digest-checked before sealing, qualification, and execution. The declared
 verifier command must point to a verifier inside the same tree.
 
 Preparation scripts are therefore digest-locked, but their outputs must not be. Exact
-closure over the envelope tree is re-evaluated immediately before every control and before
+closure over the promise tree is re-evaluated immediately before every control and before
 the target run, so any file a preparation step creates inside that tree makes the run
 `custody-invalid` rather than failing it. Installs, package-manager and build caches,
 compiled artifacts, virtual environments, regenerated lockfiles, and scratch files belong
-outside `.continuity/envelopes/<envelope-id>/`. This is a deliberate consequence of the
+outside `.continuity/promises/<promise-id>/`. This is a deliberate consequence of the
 closure rule and not a limitation to be worked around by removing files from the package.
 
-A verifier can import or invoke application code outside its envelope tree because that
+A verifier can import or invoke application code outside its promise tree because that
 code is the system under test. Those external dependencies are not verifier custody. If a
 helper determines how the promise is asserted rather than implementing the product being
-tested, move it into the envelope tree and declare it as support material.
+tested, move it into the promise tree and declare it as support material.
 
 The attestor executable is selected solely from GitHub's identity for the running reusable
 workflow: `job.workflow_repository`, `job.workflow_ref`, `job.workflow_sha`, and
@@ -60,7 +60,7 @@ therefore outside the v0 support boundary.
 The runner has two output channels and they never mix. Standard output carries the closed
 result JSON that the workflow redirects into the artifact a token-bearing job publishes.
 Standard error carries what a person reads: each verifier's own stdout and stderr, a
-sentence per envelope naming the envelope, the control, the outcome and the approved
+sentence per promise naming the promise, the control, the outcome and the approved
 observable outcome, a GitHub annotation, and a job-summary table.
 
 That explanation reaches the customer's own GitHub job log only. It is never added to a
@@ -69,13 +69,13 @@ published payload is exactly what it was before verifier output became visible: 
 outcomes and SHA-256 digests over the raw bytes.
 
 Echoed text is untrusted input to that log: verifier bytes, package prose written by the
-customer, and envelope ids from the frozen manifest. GitHub Actions reads workflow commands
+customer, and promise ids from the frozen manifest. GitHub Actions reads workflow commands
 such as `::error::` from a job's output, so every echoed line is stripped of control
 characters, capped in length, and printed behind a fixed `[balladeer]` prefix. Echoed text
 can never begin a line and therefore cannot forge an annotation, a job-summary write, or
 any other workflow command. The echo is bounded at the same 1 MiB per stream the digests
 use, counted in bytes written to the log so that short lines cannot multiply through the
-prefix. Nothing from a control-plane response is printed beyond bounded envelope ids.
+prefix. Nothing from a control-plane response is printed beyond bounded promise ids.
 
 ## Fixed destinations
 

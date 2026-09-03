@@ -80,7 +80,7 @@ jobs:
           target_id="$(jq -er '.targetId | select(test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))' <<<"$response")"
           manifest_digest="$(jq -er '.manifestDigest | select(test("^sha256:[a-f0-9]{64}$"))' <<<"$response")"
           challenge="$(jq -er '.challenge | select(length >= 32 and length <= 256 and test("^[A-Za-z0-9_-]+$"))' <<<"$response")"
-          jq -e --arg targetId "$target_id" --arg digest "$manifest_digest" '.manifest | .schemaVersion == "continuity-ci/v1" and .targetId == $targetId and .manifestDigest == $digest and (.envelopes | type == "array")' <<<"$response" >/dev/null
+          jq -e --arg targetId "$target_id" --arg digest "$manifest_digest" '.manifest | .schemaVersion == "continuity-ci/v1" and .targetId == $targetId and .manifestDigest == $digest and (.promises | type == "array")' <<<"$response" >/dev/null
           printf 'target_id=%s\n' "$target_id" >> "$GITHUB_OUTPUT"
           printf 'manifest_digest=%s\n' "$manifest_digest" >> "$GITHUB_OUTPUT"
           printf 'challenge=%s\n' "$challenge" >> "$GITHUB_OUTPUT"
@@ -155,12 +155,12 @@ jobs:
         run: |
           set -euo pipefail
           if jq -e 'any(.results[]; .outcome != "pass")' "$RESULT_PATH" >/dev/null; then
-            echo "Balladeer advisory check: at least one active envelope failed or is inconclusive."
-            jq -r '.results[] | "\(.envelopeId): \(.outcome)"' "$RESULT_PATH"
+            echo "Balladeer advisory check: at least one active promise failed or is inconclusive."
+            jq -r '.results[] | "\(.promiseId): \(.outcome)"' "$RESULT_PATH"
             exit 1
           fi
           if jq -e '(.results | length) == 0' "$RESULT_PATH" >/dev/null; then
-            echo "Balladeer setup check: workflow identity authenticated; no active envelopes exist yet."
+            echo "Balladeer setup check: workflow identity authenticated; no active promises exist yet."
           fi
 
   publish:
@@ -190,7 +190,7 @@ jobs:
             exit 0
           fi
           token="$(curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BALLADEER_OIDC_AUDIENCE" | jq -er .value)"
-          jq --arg workspaceLocator "$WORKSPACE_LOCATOR" --arg targetId "$TARGET_ID" --arg manifestDigest "$MANIFEST_DIGEST" --arg runId "$GH_RUN_ID" --arg challenge "$CHALLENGE" '{schemaVersion:"continuity-ci/v1",mode:"target",workspaceLocator:$workspaceLocator,targetId:$targetId,manifestDigest:$manifestDigest,runId:$runId,challenge:$challenge,results:.results,shadowApplicability:(reduce .results[] as $r ({}; .[$r.envelopeId] = null))}' continuity-results.json > publish.json
+          jq --arg workspaceLocator "$WORKSPACE_LOCATOR" --arg targetId "$TARGET_ID" --arg manifestDigest "$MANIFEST_DIGEST" --arg runId "$GH_RUN_ID" --arg challenge "$CHALLENGE" '{schemaVersion:"continuity-ci/v1",mode:"target",workspaceLocator:$workspaceLocator,targetId:$targetId,manifestDigest:$manifestDigest,runId:$runId,challenge:$challenge,results:.results,shadowApplicability:(reduce .results[] as $r ({}; .[$r.promiseId] = null))}' continuity-results.json > publish.json
           curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/results" \
             -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @publish.json
 
@@ -255,9 +255,9 @@ jobs:
           fi
           echo "has_receipts=true" >> "$GITHUB_OUTPUT"
           for metadata in "${metadata_files[@]}"; do
-            envelope_id="$(basename "$metadata" .json)"
-            package=".continuity/packages/${envelope_id}.json"
-            node "$BALLADEER_TRUSTED_RUNNER" qualification-request "$package" "$metadata" "$request_dir/${envelope_id}.json"
+            promise_id="$(basename "$metadata" .json)"
+            package=".continuity/packages/${promise_id}.json"
+            node "$BALLADEER_TRUSTED_RUNNER" qualification-request "$package" "$metadata" "$request_dir/${promise_id}.json"
           done
           echo "QUALIFICATION_REQUEST_DIR=$request_dir" >> "$GITHUB_ENV"
       - name: Upload closed qualification receipts only

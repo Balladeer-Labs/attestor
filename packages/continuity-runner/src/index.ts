@@ -27,13 +27,13 @@ export interface BehavioralExample {
   expectedOutcome: string;
 }
 
-export interface EnvelopeScope {
+export interface PromiseScope {
   repositoryId: string;
   surfaces: string[];
   labels: string[];
 }
 
-export interface EnvelopeMeaning {
+export interface PromiseMeaning {
   id: string;
   semanticDigest: string;
   title: string;
@@ -47,7 +47,7 @@ export interface EnvelopeMeaning {
   failingExamples: BehavioralExample[];
   refactorExamples: BehavioralExample[];
   ownerId: string;
-  scope: EnvelopeScope;
+  scope: PromiseScope;
 }
 
 export interface VerifierCommand {
@@ -70,14 +70,14 @@ export interface LockedMaterial {
 }
 export interface AcceptancePackage {
   schemaVersion: typeof RUNNER_SCHEMA;
-  envelope: EnvelopeMeaning;
+  promise: PromiseMeaning;
   verifier: VerifierSpec;
   materials: LockedMaterial[];
   packageDigest: string;
 }
 export interface AcceptancePackageDraft {
   schemaVersion: typeof RUNNER_SCHEMA;
-  envelope: EnvelopeMeaning;
+  promise: PromiseMeaning;
   verifier: VerifierSpec;
   materials: Array<Omit<LockedMaterial, "digest">>;
 }
@@ -92,7 +92,7 @@ export interface QualificationMetadata {
 }
 
 export interface TamperControlResult {
-  envelopeId: string;
+  promiseId: string;
   outcome: "detected" | "not_detected" | "unknown";
   resultDigest: string;
 }
@@ -109,7 +109,7 @@ export type RunOutcome = "pass" | "fail" | "unknown" | "canceled" | "custody-inv
 export interface RunResult {
   schemaVersion: typeof RUNNER_SCHEMA;
   runnerVersion: string;
-  envelopeId: string;
+  promiseId: string;
   packageDigest: string;
   /** The exact commit checked out by the customer runner. */
   sourceSha: string;
@@ -129,7 +129,7 @@ export interface ExecutionManifest {
   schemaVersion: "continuity-ci/v1";
   targetId: string;
   generatedAt: string;
-  envelopes: { id: string; packageDigest: string }[];
+  promises: { id: string; packageDigest: string }[];
   manifestDigest: string;
 }
 
@@ -150,11 +150,11 @@ const meaningKeys = [
   "scope",
 ];
 const commandKeys = ["executable", "args", "cwd", "timeoutMs"];
-const packageKeys = ["schemaVersion", "envelope", "verifier", "materials", "packageDigest"];
+const packageKeys = ["schemaVersion", "promise", "verifier", "materials", "packageDigest"];
 const resultKeys = [
   "schemaVersion",
   "runnerVersion",
-  "envelopeId",
+  "promiseId",
   "packageDigest",
   "sourceSha",
   "control",
@@ -170,6 +170,56 @@ const resultKeys = [
 ];
 const isGitSha = (value: unknown): value is string =>
   typeof value === "string" && value.length === 40 && /^[0-9a-f]{40}$/.test(value);
+
+// ---------------------------------------------------------------------------
+// The product's noun is `promise`, in the protocol as well as the prose. A
+// package written against the retired noun is still valid JSON, so it would
+// otherwise fail with a generic "unknown field" error and leave the person or
+// agent reading a customer's job log guessing why a package that used to work
+// no longer does. Name the retired shape and refuse it.
+//
+// This is the only place the retired word may appear, and it is assembled from
+// fragments so that `check-release` can assert the whole word survives nowhere
+// in this repository. The refusal message a customer reads still spells it out.
+// ---------------------------------------------------------------------------
+const retiredNoun = ["envel", "ope"].join("");
+const retiredIdPrefix = "env_";
+const retiredIdPattern = new RegExp(`^${retiredIdPrefix}`);
+
+function retiredShapeError(label: string, detail: string): Error {
+  return new Error(
+    `${label} uses the retired ${retiredNoun} naming: ${detail} The retired shape is refused, never migrated in place.`,
+  );
+}
+
+const retiredPackageDetail = `it carries the "${retiredNoun}" key or an ${retiredIdPrefix} id, but the product's noun is now promise, so a package must carry the "promise" key and a prom_ id. Regenerate the package with Balladeer.`;
+
+/** Refuse a retired package key before a generic unknown-field error hides it. */
+function assertNotRetiredShape(input: unknown, label: string): void {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return;
+  if (Object.prototype.hasOwnProperty.call(input, retiredNoun))
+    throw retiredShapeError(label, retiredPackageDetail);
+}
+
+/** Refuse a retired id, whichever key carried it. */
+function assertNotRetiredId(id: string, label: string): void {
+  if (retiredIdPattern.test(id)) throw retiredShapeError(label, retiredPackageDetail);
+}
+
+/**
+ * A frozen manifest is produced by the control plane rather than by the
+ * customer, so a retired manifest means this attestor release and the control
+ * plane disagree about the protocol noun. Say that, instead of reporting an
+ * unknown field.
+ */
+function assertNotRetiredManifest(input: unknown): void {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return;
+  if (Object.prototype.hasOwnProperty.call(input, `${retiredNoun}s`))
+    throw retiredShapeError(
+      "manifest",
+      `it lists "${retiredNoun}s" where this runner requires "promises", so this attestor release and the control plane that produced the manifest disagree on the protocol noun.`,
+    );
+}
 
 // The scaffold's marker is deliberately not the only readiness guard. A
 // customer can remove a comment without having authored a verifier. Keep a
@@ -255,8 +305,8 @@ function validateExamples(value: unknown, label: string): BehavioralExample[] {
   return value as BehavioralExample[];
 }
 
-function semanticMeaning(envelope: EnvelopeMeaning) {
-  const { id: _id, ownerId: _ownerId, semanticDigest: _semanticDigest, ...meaning } = envelope;
+function semanticMeaning(promise: PromiseMeaning) {
+  const { id: _id, ownerId: _ownerId, semanticDigest: _semanticDigest, ...meaning } = promise;
   return meaning;
 }
 
@@ -294,28 +344,30 @@ export function packageDigest(
   return sha256(canonicalize(withoutDigest(pkg as AcceptancePackage)));
 }
 export function validatePackage(input: unknown): AcceptancePackage {
+  assertNotRetiredShape(input, "package");
   keysAre(input, packageKeys, "package");
   if (input.schemaVersion !== RUNNER_SCHEMA)
     throw new Error(`package.schemaVersion must be ${RUNNER_SCHEMA}`);
-  keysAre(input.envelope, meaningKeys, "envelope");
-  const envelopeId = stringField(input.envelope.id, "envelope.id");
+  keysAre(input.promise, meaningKeys, "promise");
+  const promiseId = stringField(input.promise.id, "promise.id");
   for (const key of ["title", "beneficiary", "trigger", "observableOutcome", "ownerId"])
-    stringField(input.envelope[key], `envelope.${key}`);
-  if (!/^env_[a-z0-9]{8,64}$/.test(envelopeId))
-    throw new Error("envelope.id is invalid");
-  digestField(input.envelope.semanticDigest, "envelope.semanticDigest");
+    stringField(input.promise[key], `promise.${key}`);
+  assertNotRetiredId(promiseId, "package");
+  if (!/^prom_[a-z0-9]{8,64}$/.test(promiseId))
+    throw new Error("promise.id is invalid");
+  digestField(input.promise.semanticDigest, "promise.semanticDigest");
   for (const key of ["preconditions", "allowedVariations", "nonGoals"])
-    stringArray(input.envelope[key], `envelope.${key}`);
+    stringArray(input.promise[key], `promise.${key}`);
   for (const key of ["passingExamples", "failingExamples", "refactorExamples"])
-    validateExamples(input.envelope[key], `envelope.${key}`);
-  keysAre(input.envelope.scope, ["repositoryId", "surfaces", "labels"], "envelope.scope");
-  stringField(input.envelope.scope.repositoryId, "envelope.scope.repositoryId");
-  const surfaces = stringArray(input.envelope.scope.surfaces, "envelope.scope.surfaces");
-  stringArray(input.envelope.scope.labels, "envelope.scope.labels");
-  if (surfaces.length < 1) throw new Error("envelope.scope.surfaces requires at least one marker");
-  const typedEnvelope = input.envelope as unknown as EnvelopeMeaning;
-  if (typedEnvelope.semanticDigest !== sha256(canonicalize(semanticMeaning(typedEnvelope))))
-    throw new Error("envelope.semanticDigest does not match approved meaning");
+    validateExamples(input.promise[key], `promise.${key}`);
+  keysAre(input.promise.scope, ["repositoryId", "surfaces", "labels"], "promise.scope");
+  stringField(input.promise.scope.repositoryId, "promise.scope.repositoryId");
+  const surfaces = stringArray(input.promise.scope.surfaces, "promise.scope.surfaces");
+  stringArray(input.promise.scope.labels, "promise.scope.labels");
+  if (surfaces.length < 1) throw new Error("promise.scope.surfaces requires at least one marker");
+  const typedPromise = input.promise as unknown as PromiseMeaning;
+  if (typedPromise.semanticDigest !== sha256(canonicalize(semanticMeaning(typedPromise))))
+    throw new Error("promise.semanticDigest does not match approved meaning");
   keysAre(input.verifier, ["target", "good", "bad", "refactor"], "verifier");
   for (const control of RUN_MODES) {
     const command = input.verifier[control];
@@ -346,9 +398,9 @@ export function validatePackage(input: unknown): AcceptancePackage {
       path.split("/").some((part) => part === "" || part === "." || part === "..")
     )
       throw new Error(`materials[${index}].path must be a normalized repository-relative path`);
-    if (!path.startsWith(`.continuity/envelopes/${envelopeId}/`))
+    if (!path.startsWith(`.continuity/promises/${promiseId}/`))
       throw new Error(
-        `materials[${index}].path must be inside .continuity/envelopes/${envelopeId}`,
+        `materials[${index}].path must be inside .continuity/promises/${promiseId}`,
       );
     if (!["verifier", "fixture", "support"].includes(material.kind as string))
       throw new Error(`materials[${index}].kind is invalid`);
@@ -398,9 +450,9 @@ export async function readPackages(path: string): Promise<AcceptancePackage[]> {
 /**
  * Read every sealed package that can be read, and report the files that cannot
  * instead of failing the whole catalog. A file that does not validate simply
- * does not answer for its envelope: the manifest selection then reports that
- * envelope as custody-invalid, exactly as a deleted file would, and every other
- * envelope still runs. A package directory that does not exist yields no
+ * does not answer for its promise: the manifest selection then reports that
+ * promise as custody-invalid, exactly as a deleted file would, and every other
+ * promise still runs. A package directory that does not exist yields no
  * packages rather than an error, for the same reason.
  *
  * The returned file names are for the customer's own log. They are never part
@@ -439,14 +491,14 @@ export async function readAvailablePackages(
   return { packages, rejected };
 }
 
-async function envelopeMaterialInventory(
-  envelopeId: string,
+async function promiseMaterialInventory(
+  promiseId: string,
   executionRoot: string,
 ): Promise<string[]> {
   const root = await realpath(executionRoot).catch(() => {
     throw new Error("execution root is unavailable");
   });
-  const materialRoot = `.continuity/envelopes/${envelopeId}`;
+  const materialRoot = `.continuity/promises/${promiseId}`;
   let cursor = root;
   for (const segment of materialRoot.split("/")) {
     cursor = pathResolve(cursor, segment);
@@ -454,10 +506,10 @@ async function envelopeMaterialInventory(
     try {
       info = await lstat(cursor);
     } catch {
-      throw new Error(`envelope material root is unavailable: ${materialRoot}`);
+      throw new Error(`promise material root is unavailable: ${materialRoot}`);
     }
     if (info.isSymbolicLink() || !info.isDirectory())
-      throw new Error(`envelope material root must contain only real directories: ${materialRoot}`);
+      throw new Error(`promise material root must contain only real directories: ${materialRoot}`);
   }
 
   const files: string[] = [];
@@ -467,13 +519,13 @@ async function envelopeMaterialInventory(
     )) {
       const child = pathResolve(directory, entry.name);
       if (entry.isSymbolicLink())
-        throw new Error(`envelope material tree contains a symbolic link: ${relative(root, child)}`);
+        throw new Error(`promise material tree contains a symbolic link: ${relative(root, child)}`);
       if (entry.isDirectory()) await visit(child);
       else if (entry.isFile()) {
         files.push(relative(root, child));
-        if (files.length > 256) throw new Error("envelope material tree exceeds 256 files");
+        if (files.length > 256) throw new Error("promise material tree exceeds 256 files");
       } else {
-        throw new Error(`envelope material tree contains a non-regular file: ${relative(root, child)}`);
+        throw new Error(`promise material tree contains a non-regular file: ${relative(root, child)}`);
       }
     }
   };
@@ -482,11 +534,11 @@ async function envelopeMaterialInventory(
 }
 
 async function assertExactMaterialClosure(
-  envelopeId: string,
+  promiseId: string,
   materials: LockedMaterial[],
   executionRoot: string,
 ): Promise<void> {
-  const actual = await envelopeMaterialInventory(envelopeId, executionRoot);
+  const actual = await promiseMaterialInventory(promiseId, executionRoot);
   const declared = materials.map((material) => material.path).sort();
   const actualSet = new Set(actual);
   const declaredSet = new Set(declared);
@@ -494,12 +546,12 @@ async function assertExactMaterialClosure(
   const unavailable = declared.filter((path) => !actualSet.has(path));
   if (undeclared.length || unavailable.length)
     throw new Error(
-      `envelope material closure mismatch (undeclared: ${undeclared.join(", ") || "none"}; unavailable: ${unavailable.join(", ") || "none"})`,
+      `promise material closure mismatch (undeclared: ${undeclared.join(", ") || "none"}; unavailable: ${unavailable.join(", ") || "none"})`,
     );
 }
 
 /**
- * Customer-local authoring helper. It inventories the envelope-owned material
+ * Customer-local authoring helper. It inventories the promise-owned material
  * tree, requires the draft to declare every regular file in that tree, writes
  * nothing, and returns the portable sealed package. The caller chooses whether
  * and where to persist it.
@@ -508,16 +560,18 @@ export async function sealPackageDraft(
   input: unknown,
   executionRoot = process.cwd(),
 ): Promise<AcceptancePackage> {
-  keysAre(input, ["schemaVersion", "envelope", "verifier", "materials"], "package draft");
+  assertNotRetiredShape(input, "package draft");
+  keysAre(input, ["schemaVersion", "promise", "verifier", "materials"], "package draft");
   if (!Array.isArray(input.materials)) throw new Error("package draft materials must be an array");
-  if (!input.envelope || typeof input.envelope !== "object" || Array.isArray(input.envelope))
-    throw new Error("package draft envelope must be an object");
-  const envelopeId = stringField(
-    (input.envelope as Record<string, unknown>).id,
-    "package draft envelope.id",
+  if (!input.promise || typeof input.promise !== "object" || Array.isArray(input.promise))
+    throw new Error("package draft promise must be an object");
+  const promiseId = stringField(
+    (input.promise as Record<string, unknown>).id,
+    "package draft promise.id",
   );
-  if (!/^env_[a-z0-9]{8,64}$/.test(envelopeId))
-    throw new Error("package draft envelope.id is invalid");
+  assertNotRetiredId(promiseId, "package draft");
+  if (!/^prom_[a-z0-9]{8,64}$/.test(promiseId))
+    throw new Error("package draft promise.id is invalid");
   let root: string;
   try {
     root = await realpath(executionRoot);
@@ -536,9 +590,9 @@ export async function sealPackageDraft(
       throw new Error(
         `package draft materials[${index}].path must be a normalized repository-relative path`,
       );
-    if (!path.startsWith(`.continuity/envelopes/${envelopeId}/`))
+    if (!path.startsWith(`.continuity/promises/${promiseId}/`))
       throw new Error(
-        `package draft materials[${index}].path must be inside .continuity/envelopes/${envelopeId}`,
+        `package draft materials[${index}].path must be inside .continuity/promises/${promiseId}`,
       );
     if (!["verifier", "fixture", "support"].includes(material.kind as string))
       throw new Error(`package draft materials[${index}].kind is invalid`);
@@ -568,11 +622,11 @@ export async function sealPackageDraft(
       digest: `sha256:${createHash("sha256").update(contents).digest("hex")}`,
     });
   }
-  await assertExactMaterialClosure(envelopeId, materials, root);
-  assertNoStarterPlaceholders(input.envelope, materials, "package draft");
+  await assertExactMaterialClosure(promiseId, materials, root);
+  assertNoStarterPlaceholders(input.promise, materials, "package draft");
   const base = {
     schemaVersion: input.schemaVersion,
-    envelope: input.envelope,
+    promise: input.promise,
     verifier: input.verifier,
     materials,
   } as Omit<AcceptancePackage, "packageDigest">;
@@ -580,11 +634,11 @@ export async function sealPackageDraft(
 }
 
 function assertNoStarterPlaceholders(
-  envelope: unknown,
+  promise: unknown,
   materials: LockedMaterial[],
   label: string,
 ): void {
-  const serialized = JSON.stringify(envelope);
+  const serialized = JSON.stringify(promise);
   if (serialized.includes("REPLACE_WITH_") || /replace with|replace me/i.test(serialized))
     throw new Error(`${label} still contains scaffold placeholders; replace the approved meaning`);
   for (const material of materials) {
@@ -603,7 +657,7 @@ export async function assertPackageReady(
   executionRoot = process.cwd(),
 ): Promise<AcceptancePackage> {
   const pkg = validatePackage(pkgInput);
-  await assertExactMaterialClosure(pkg.envelope.id, pkg.materials, executionRoot);
+  await assertExactMaterialClosure(pkg.promise.id, pkg.materials, executionRoot);
   const materials: LockedMaterial[] = [];
   for (const material of pkg.materials) {
     let contents: Buffer;
@@ -619,7 +673,7 @@ export async function assertPackageReady(
       throw new Error("package still contains the scaffold verifier");
     materials.push(material);
   }
-  assertNoStarterPlaceholders(pkg.envelope, materials, "package");
+  assertNoStarterPlaceholders(pkg.promise, materials, "package");
   if (pkg.materials.some((material) => material.digest === sha256('{\n  "replaceMe": true\n}\n')))
     throw new Error("package still contains the scaffold fixture");
   return pkg;
@@ -715,7 +769,7 @@ export async function buildQualificationRequest(
   const byControl = new Map(results.map((result) => [result.control, result]));
   const tamperControl = await runTamperControl(pkg, executionRoot, metadata.sourceSha);
   // Every published control is the same closed pair. The tamper control's
-  // local result also carries the envelope id, which the receipt already
+  // local result also carries the promise id, which the receipt already
   // binds through packageDigest and semanticDigest, so it is projected to
   // { outcome, resultDigest } like good/bad/refactor rather than sent whole.
   // The tamper detection semantics are unchanged; only the published shape is
@@ -753,7 +807,7 @@ export async function buildQualificationRequest(
     targetSha: metadata.targetSha,
     sourceSha: metadata.sourceSha,
     revisionId: metadata.revisionId,
-    semanticDigest: pkg.envelope.semanticDigest,
+    semanticDigest: pkg.promise.semanticDigest,
     bindingId: metadata.bindingId,
     packageDigest: pkg.packageDigest,
     verifierDigest: lockedMaterialsDigest(pkg, ["verifier"]),
@@ -773,13 +827,14 @@ export async function buildQualificationRequest(
  */
 export async function scaffoldPackage(
   outputPath: string,
-  envelopeId = "env_example01",
+  promiseId = "prom_example01",
   executionRoot = process.cwd(),
 ): Promise<ScaffoldResult> {
   if (outputPath !== ".continuity")
     throw new Error("scaffold output must be the repository-local .continuity directory");
-  if (!/^env_[a-z0-9]{8,64}$/.test(envelopeId))
-    throw new Error("scaffold envelope id must match env_[a-z0-9]{8,64}");
+  assertNotRetiredId(promiseId, "scaffold");
+  if (!/^prom_[a-z0-9]{8,64}$/.test(promiseId))
+    throw new Error("scaffold promise id must match prom_[a-z0-9]{8,64}");
   const root = await realpath(executionRoot).catch(() => {
     throw new Error("scaffold execution root is unavailable");
   });
@@ -800,10 +855,10 @@ export async function scaffoldPackage(
     await mkdir(destination, { recursive: true });
   }
 
-  const envelopeRoot = `${outputPath}/envelopes/${envelopeId}`;
-  const verifierPath = `${envelopeRoot}/verifier.mjs`;
-  const fixturePath = `${envelopeRoot}/fixture.json`;
-  const draftPath = `${outputPath}/drafts/${envelopeId}.json`;
+  const promiseRoot = `${outputPath}/promises/${promiseId}`;
+  const verifierPath = `${promiseRoot}/verifier.mjs`;
+  const fixturePath = `${promiseRoot}/fixture.json`;
+  const draftPath = `${outputPath}/drafts/${promiseId}.json`;
   const readmePath = `${outputPath}/README.md`;
   const paths = [verifierPath, fixturePath, draftPath, readmePath];
   for (const path of paths) {
@@ -820,7 +875,7 @@ export async function scaffoldPackage(
   }
 
   const meaning = {
-    id: envelopeId,
+    id: promiseId,
     title: "Replace with the customer promise",
     beneficiary: "Replace with the person or system that benefits",
     trigger: "Replace with the observable trigger",
@@ -857,9 +912,9 @@ export async function scaffoldPackage(
   };
   const draft = {
     schemaVersion: RUNNER_SCHEMA,
-    envelope: {
+    promise: {
       ...meaning,
-      semanticDigest: sha256(canonicalize(semanticMeaning(meaning as unknown as EnvelopeMeaning))),
+      semanticDigest: sha256(canonicalize(semanticMeaning(meaning as unknown as PromiseMeaning))),
       ownerId: "REPLACE_WITH_OWNER_ID",
     },
     verifier: {
@@ -875,8 +930,8 @@ export async function scaffoldPackage(
   };
   const verifier = `const control = process.argv[2];\n// BALLADEER_STARTER_VERIFIER: replace this with a real customer-behavior verifier.\nprocess.exit(control === "bad" ? 1 : 0);\n`;
   const fixture = '{\n  "replaceMe": true\n}\n';
-  const readme = `# Continuity starter\n\nThis directory was generated locally for **${envelopeId}**. It is an authoring starter, not a protected behavior.\n\n1. Replace every placeholder in drafts/${envelopeId}.json.\n2. Replace envelopes/${envelopeId}/verifier.mjs with a real verifier and update envelopes/${envelopeId}/fixture.json. The starter verifier only demonstrates control wiring.\n3. From the repository root, seal it into ${outputPath}/packages/${envelopeId}.json:\n\n   continuity-runner seal ${draftPath} ${outputPath}/packages/${envelopeId}.json\n\nThe seal command refuses to overwrite an existing output. Run the local qualification controls before asking the Balladeer owner to activate the package. No source, fixture contents, or verifier output is sent to Balladeer; only closed digests and normalized outcomes are publishable.\n`;
-  await mkdir(pathResolve(root, envelopeRoot), { recursive: true });
+  const readme = `# Continuity starter\n\nThis directory was generated locally for **${promiseId}**. It is an authoring starter, not a protected behavior.\n\n1. Replace every placeholder in drafts/${promiseId}.json.\n2. Replace promises/${promiseId}/verifier.mjs with a real verifier and update promises/${promiseId}/fixture.json. The starter verifier only demonstrates control wiring.\n3. From the repository root, seal it into ${outputPath}/packages/${promiseId}.json:\n\n   continuity-runner seal ${draftPath} ${outputPath}/packages/${promiseId}.json\n\nThe seal command refuses to overwrite an existing output. Run the local qualification controls before asking the Balladeer owner to activate the package. No source, fixture contents, or verifier output is sent to Balladeer; only closed digests and normalized outcomes are publishable.\n`;
+  await mkdir(pathResolve(root, promiseRoot), { recursive: true });
   await mkdir(pathResolve(root, `${outputPath}/drafts`), { recursive: true });
   await mkdir(pathResolve(root, `${outputPath}/packages`), { recursive: true });
   for (const [path, contents] of [
@@ -890,9 +945,10 @@ export async function scaffoldPackage(
 }
 
 export function validateExecutionManifest(input: unknown): ExecutionManifest {
+  assertNotRetiredManifest(input);
   keysAre(
     input,
-    ["schemaVersion", "targetId", "generatedAt", "envelopes", "manifestDigest"],
+    ["schemaVersion", "targetId", "generatedAt", "promises", "manifestDigest"],
     "manifest",
   );
   if (input.schemaVersion !== "continuity-ci/v1")
@@ -901,13 +957,13 @@ export function validateExecutionManifest(input: unknown): ExecutionManifest {
   stringField(input.generatedAt, "manifest.generatedAt");
   if (Number.isNaN(Date.parse(input.generatedAt as string)))
     throw new Error("manifest.generatedAt is invalid");
-  if (!Array.isArray(input.envelopes)) throw new Error("manifest.envelopes must be an array");
+  if (!Array.isArray(input.promises)) throw new Error("manifest.promises must be an array");
   const seen = new Set<string>();
-  for (const entry of input.envelopes) {
-    keysAre(entry, ["id", "packageDigest"], "manifest envelope");
-    stringField(entry.id, "manifest envelope id");
+  for (const entry of input.promises) {
+    keysAre(entry, ["id", "packageDigest"], "manifest promise");
+    stringField(entry.id, "manifest promise id");
     digestField(entry.packageDigest, "manifest packageDigest");
-    if (seen.has(entry.id as string)) throw new Error("manifest has duplicate envelope id");
+    if (seen.has(entry.id as string)) throw new Error("manifest has duplicate promise id");
     seen.add(entry.id as string);
   }
   digestField(input.manifestDigest, "manifest.manifestDigest");
@@ -919,10 +975,10 @@ export function validateExecutionManifest(input: unknown): ExecutionManifest {
 
 export type PackageUnavailableReason = "missing" | "digest-changed" | "ambiguous";
 export type ManifestEntrySelection =
-  | { kind: "package"; envelopeId: string; package: AcceptancePackage }
+  | { kind: "package"; promiseId: string; package: AcceptancePackage }
   | {
       kind: "unavailable";
-      envelopeId: string;
+      promiseId: string;
       packageDigest: string;
       reason: PackageUnavailableReason;
     };
@@ -931,9 +987,9 @@ export type ManifestRunMode = "target" | "exercise";
 /**
  * Resolve every manifest entry on its own. A missing, re-sealed, or ambiguous
  * package used to throw before any verifier ran, so the control plane received
- * no results at all and swept every other envelope into the same missing state.
+ * no results at all and swept every other promise into the same missing state.
  * Each entry now resolves to exactly one answer: a package to run, or a
- * custody-invalid verdict for that envelope alone. Manifest cardinality is
+ * custody-invalid verdict for that promise alone. Manifest cardinality is
  * preserved either way.
  */
 export function selectManifestEntries(
@@ -944,24 +1000,24 @@ export function selectManifestEntries(
   const byId = new Map<string, AcceptancePackage>();
   const ambiguous = new Set<string>();
   for (const pkg of packages) {
-    if (byId.has(pkg.envelope.id)) ambiguous.add(pkg.envelope.id);
-    else byId.set(pkg.envelope.id, pkg);
+    if (byId.has(pkg.promise.id)) ambiguous.add(pkg.promise.id);
+    else byId.set(pkg.promise.id, pkg);
   }
-  return manifest.envelopes.map((entry): ManifestEntrySelection => {
+  return manifest.promises.map((entry): ManifestEntrySelection => {
     const unavailable = (reason: PackageUnavailableReason): ManifestEntrySelection => ({
       kind: "unavailable",
-      envelopeId: entry.id,
+      promiseId: entry.id,
       packageDigest: entry.packageDigest,
       reason,
     });
     // A duplicate id is never resolved by preference: the run cannot tell which
-    // sealed package the manifest meant, so that envelope stays custody-invalid
+    // sealed package the manifest meant, so that promise stays custody-invalid
     // rather than executing a guess.
     if (ambiguous.has(entry.id)) return unavailable("ambiguous");
     const pkg = byId.get(entry.id);
     if (!pkg) return unavailable("missing");
     if (pkg.packageDigest !== entry.packageDigest) return unavailable("digest-changed");
-    return { kind: "package", envelopeId: entry.id, package: pkg };
+    return { kind: "package", promiseId: entry.id, package: pkg };
   });
 }
 
@@ -987,7 +1043,7 @@ export async function runManifestEntries(
         selection.kind === "package"
           ? await runVerifier(selection.package, control, executionRoot, sourceSha)
           : closedResult(
-              selection.envelopeId,
+              selection.promiseId,
               selection.packageDigest,
               control,
               new Date(),
@@ -1028,7 +1084,7 @@ export async function verifyLockedMaterials(
 ): Promise<boolean> {
   const pkg = validatePackage(pkgInput);
   try {
-    await assertExactMaterialClosure(pkg.envelope.id, pkg.materials, executionRoot);
+    await assertExactMaterialClosure(pkg.promise.id, pkg.materials, executionRoot);
     const root = await realpath(executionRoot);
     for (const material of pkg.materials) {
       const resolved = await realpath(pathResolve(root, material.path));
@@ -1053,7 +1109,7 @@ export function validateResult(input: unknown): RunResult {
   if (!RUN_MODES.includes(input.control as RunMode)) throw new Error("result.control is invalid");
   if (!["pass", "fail", "unknown", "canceled", "custody-invalid"].includes(input.outcome as string))
     throw new Error("result.outcome is invalid");
-  stringField(input.envelopeId, "result.envelopeId");
+  stringField(input.promiseId, "result.promiseId");
   digestField(input.packageDigest, "result.packageDigest");
   if (!isGitSha(input.sourceSha))
     throw new Error("result.sourceSha must be an exact 40-hex commit SHA");
@@ -1088,7 +1144,7 @@ export function validateResult(input: unknown): RunResult {
 // published payload; it stays inside the customer's run.
 //
 // Everything echoed is untrusted text: verifier bytes, package prose written by
-// the customer, and envelope ids from the frozen manifest. GitHub Actions reads
+// the customer, and promise ids from the frozen manifest. GitHub Actions reads
 // workflow commands such as `::error::` from a job's output, so echoed text is
 // stripped of control characters, bounded, and always printed behind a fixed
 // prefix. It can never begin a line, and therefore can never forge a command,
@@ -1132,12 +1188,12 @@ interface OutputEcho {
  * The digest is still computed over every raw byte the verifier wrote. Only
  * what a person reads is bounded and sanitized.
  */
-function outputEcho(envelopeId: string, control: RunMode): OutputEcho {
+function outputEcho(promiseId: string, control: RunMode): OutputEcho {
   const decoder = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
   const pending = { stdout: "", stderr: "" };
   const echoed = { stdout: 0, stderr: 0 };
   const stopped = { stdout: false, stderr: false };
-  const prefix = `${humanPrefix} ${loggable(envelopeId, 80)} ${control}`;
+  const prefix = `${humanPrefix} ${loggable(promiseId, 80)} ${control}`;
   const line = (stream: "stdout" | "stderr", text: string): void => {
     if (stopped[stream]) return;
     const rendered = `${prefix} ${stream}: ${loggable(text, 4_000)}\n`;
@@ -1174,10 +1230,10 @@ function outputEcho(envelopeId: string, control: RunMode): OutputEcho {
 
 function unavailableExplanation(reason: PackageUnavailableReason): string {
   if (reason === "missing")
-    return "No sealed package for this envelope is in the package directory, so no verifier ran. Restore the sealed package, or ask Balladeer to retire the envelope.";
+    return "No sealed package for this promise is in the package directory, so no verifier ran. Restore the sealed package, or ask Balladeer to retire the promise.";
   if (reason === "digest-changed")
     return "The sealed package in the repository no longer matches the frozen manifest, so no verifier ran. Activate the re-sealed package with Balladeer.";
-  return "More than one sealed package declares this envelope id, so no verifier ran. Remove the duplicate.";
+  return "More than one sealed package declares this promise id, so no verifier ran. Remove the duplicate.";
 }
 
 const summaryLimit = 65_536;
@@ -1188,7 +1244,7 @@ async function appendJobSummary(rows: string[]): Promise<void> {
   const table = [
     "### Balladeer continuity attestor",
     "",
-    "| Envelope | Control | Outcome | Detail |",
+    "| Promise | Control | Outcome | Detail |",
     "| --- | --- | --- | --- |",
     ...rows,
     "",
@@ -1201,7 +1257,7 @@ async function appendJobSummary(rows: string[]): Promise<void> {
 }
 
 /**
- * Say what happened, in the customer's own job log, for every envelope the run
+ * Say what happened, in the customer's own job log, for every promise the run
  * covered. This is explanation only: it reads finished results and writes to
  * the human channel, the GitHub annotation stream, and the job summary. It
  * never changes a result and never adds a field to what is published.
@@ -1213,23 +1269,28 @@ export async function announceRun(
 ): Promise<void> {
   const cell = (value: string, limit: number): string =>
     loggable(value, limit).replace(/\|/g, "\\|");
-  const byEnvelope = new Map(selections.map((selection) => [selection.envelopeId, selection]));
+  const byPromise = new Map(selections.map((selection) => [selection.promiseId, selection]));
   for (const file of rejectedPackageFiles)
     humanLine(
       `a package file was skipped because it is not a valid sealed package: ${loggable(file, 200)}`,
     );
   if (results.length === 0) return;
-  humanLine(`${results.length} verifier result(s) across ${selections.length} active envelope(s).`);
+  humanLine(`${results.length} verifier result(s) across ${selections.length} active promise(s).`);
   const rows: string[] = [];
   for (const result of results) {
-    const selection = byEnvelope.get(result.envelopeId);
+    const selection = byPromise.get(result.promiseId);
     const pkg = selection?.kind === "package" ? selection.package : undefined;
-    const title = pkg ? loggable(pkg.envelope.title, 160) : "";
-    const promise = pkg ? loggable(pkg.envelope.observableOutcome, 240) : "";
+    const title = pkg ? loggable(pkg.promise.title, 160) : "";
+    const approvedOutcome = pkg ? loggable(pkg.promise.observableOutcome, 240) : "";
     const reason = selection?.kind === "unavailable" ? unavailableExplanation(selection.reason) : "";
-    const envelope = loggable(result.envelopeId, 80);
-    const subject = title === "" ? envelope : `${envelope} (${title})`;
-    const detail = reason !== "" ? reason : promise === "" ? "" : `Approved observable outcome: ${promise}`;
+    const promiseId = loggable(result.promiseId, 80);
+    const subject = title === "" ? promiseId : `${promiseId} (${title})`;
+    const detail =
+      reason !== ""
+        ? reason
+        : approvedOutcome === ""
+          ? ""
+          : `Approved observable outcome: ${approvedOutcome}`;
     const sentence = `${subject}: ${result.control} control outcome ${result.outcome}.${detail === "" ? "" : ` ${detail}`}`;
     humanLine(sentence);
     annotate(result.outcome === "pass" ? "notice" : "error", sentence);
@@ -1281,7 +1342,7 @@ export async function runVerifier(
   const started = new Date();
   const custodyInvalid = (): RunResult =>
     closedResult(
-      pkg.envelope.id,
+      pkg.promise.id,
       pkg.packageDigest,
       control,
       started,
@@ -1305,7 +1366,7 @@ export async function runVerifier(
     return custodyInvalid();
   }
   return new Promise((settle) => {
-    const echo = outputEcho(pkg.envelope.id, control);
+    const echo = outputEcho(pkg.promise.id, control);
     let stdoutBytes = 0;
     let stderrBytes = 0;
     const stdoutHash = createHash("sha256");
@@ -1368,7 +1429,7 @@ export async function runVerifier(
       const base: Omit<RunResult, "resultDigest"> = {
         schemaVersion: RUNNER_SCHEMA,
         runnerVersion: RUNNER_VERSION,
-        envelopeId: pkg.envelope.id,
+        promiseId: pkg.promise.id,
         packageDigest: pkg.packageDigest,
         sourceSha,
         control,
@@ -1404,14 +1465,14 @@ export async function runVerifier(
   });
 }
 /**
- * A result reached without running a verifier. It is addressed by envelope id
+ * A result reached without running a verifier. It is addressed by promise id
  * and package digest rather than by a package object, because the manifest can
- * name an envelope whose sealed package is missing, re-sealed, or ambiguous:
+ * name a promise whose sealed package is missing, re-sealed, or ambiguous:
  * that entry still owes the control plane exactly one closed result, carrying
  * the digest the frozen manifest expected.
  */
 function closedResult(
-  envelopeId: string,
+  promiseId: string,
   packageDigest: string,
   control: RunMode,
   started: Date,
@@ -1424,7 +1485,7 @@ function closedResult(
   const base: Omit<RunResult, "resultDigest"> = {
     schemaVersion: RUNNER_SCHEMA,
     runnerVersion: RUNNER_VERSION,
-    envelopeId,
+    promiseId,
     packageDigest,
     sourceSha,
     control,
@@ -1510,7 +1571,7 @@ export async function runTamperControl(
     try {
       const observed = await runVerifier(pkg, "good", root, sourceSha);
       return {
-        envelopeId: pkg.envelope.id,
+        promiseId: pkg.promise.id,
         outcome: observed.custody === "invalid" ? "detected" : "not_detected",
         resultDigest: observed.resultDigest,
       };
@@ -1521,9 +1582,9 @@ export async function runTamperControl(
     if (error instanceof Error && error.message === "tamper material escapes the repository root")
       throw error;
     return {
-      envelopeId: pkg.envelope.id,
+      promiseId: pkg.promise.id,
       outcome: "unknown",
-      resultDigest: sha256(`tamper-control-error:${pkg.envelope.id}`),
+      resultDigest: sha256(`tamper-control-error:${pkg.promise.id}`),
     };
   }
 }
@@ -1538,17 +1599,17 @@ export async function runTamperControls(
   return controls;
 }
 export function exercisePasses(results: RunResult[]): boolean {
-  const envelopeIds = new Set(results.map((result) => result.envelopeId));
+  const promiseIds = new Set(results.map((result) => result.promiseId));
   return (
-    envelopeIds.size > 0 &&
-    [...envelopeIds].every((envelopeId) =>
+    promiseIds.size > 0 &&
+    [...promiseIds].every((promiseId) =>
       CONTROLS.every(
         (control) =>
-          results.filter((result) => result.envelopeId === envelopeId && result.control === control)
+          results.filter((result) => result.promiseId === promiseId && result.control === control)
             .length === 1 &&
           results.some(
             (result) =>
-              result.envelopeId === envelopeId &&
+              result.promiseId === promiseId &&
               result.control === control &&
               result.outcome === "pass",
           ),
@@ -1560,7 +1621,7 @@ export function exercisePasses(results: RunResult[]): boolean {
 export function detectsPackageTampering(pkgInput: AcceptancePackage): boolean {
   const pkg = validatePackage(pkgInput);
   const changed = structuredClone(pkg);
-  changed.envelope.title = `${changed.envelope.title} (tampered)`;
+  changed.promise.title = `${changed.promise.title} (tampered)`;
   try {
     validatePackage(changed);
     return false;
@@ -1595,8 +1656,8 @@ export function qualificationSummary(
   verifierTamperDetected: boolean;
   tamperDetected: boolean;
   custody: "customer-local-unattested";
-  perEnvelope: {
-    envelopeId: string;
+  perPromise: {
+    promiseId: string;
     controlsPassed: boolean;
     packageTamperDetected: boolean;
     verifierTamperDetected: boolean;
@@ -1605,15 +1666,15 @@ export function qualificationSummary(
     materialsDigest: string;
   }[];
 } {
-  const perEnvelope = packages.map((pkg) => {
-    const ownResults = results.filter((result) => result.envelopeId === pkg.envelope.id);
-    const tamper = tamperControls.find((item) => item.envelopeId === pkg.envelope.id);
+  const perPromise = packages.map((pkg) => {
+    const ownResults = results.filter((result) => result.promiseId === pkg.promise.id);
+    const tamper = tamperControls.find((item) => item.promiseId === pkg.promise.id);
     // A metadata mutation is not an executed tamper control. Qualification
     // must be based on the real material mutation exercised by
     // `qualification-request`; callers that did not run it stay unknown.
     const tamperDetected = tamper?.outcome === "detected";
     return {
-      envelopeId: pkg.envelope.id,
+      promiseId: pkg.promise.id,
       controlsPassed: exercisePasses(ownResults),
       packageTamperDetected: tamperDetected,
       verifierTamperDetected: tamperDetected,
@@ -1629,12 +1690,12 @@ export function qualificationSummary(
   return {
     sourceSha,
     sourceShaConsistent,
-    allControlsPassed: sourceShaConsistent && perEnvelope.every((item) => item.controlsPassed),
-    packageTamperDetected: perEnvelope.every((item) => item.packageTamperDetected),
-    verifierTamperDetected: perEnvelope.every((item) => item.verifierTamperDetected),
-    tamperDetected: perEnvelope.every((item) => item.tamperDetected),
+    allControlsPassed: sourceShaConsistent && perPromise.every((item) => item.controlsPassed),
+    packageTamperDetected: perPromise.every((item) => item.packageTamperDetected),
+    verifierTamperDetected: perPromise.every((item) => item.verifierTamperDetected),
+    tamperDetected: perPromise.every((item) => item.tamperDetected),
     custody: "customer-local-unattested",
-    perEnvelope,
+    perPromise,
   };
 }
 export function createOffboardingExport(pkgInput: AcceptancePackage, results: RunResult[] = []) {
