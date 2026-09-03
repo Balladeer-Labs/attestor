@@ -56,9 +56,27 @@ jobs:
           set -euo pipefail
           test -n "$GH_BASE_SHA" && test "$GH_BASE_SHA" != '0000000000000000000000000000000000000000'
           token="$(curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BALLADEER_OIDC_AUDIENCE" | jq -er .value)"
-          response="$(curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/targets/register" \
+          # A control-plane refusal has to be readable by the customer who hit it, so the
+          # response body goes to a file and only the HTTP status reaches stdout. On a
+          # non-2xx status the bounded server error body is printed before this step
+          # fails. The request is unchanged, and no request header or bearer token is
+          # ever printed.
+          response_path="$RUNNER_TEMP/balladeer-register-response.json"
+          status="$(curl --connect-timeout 10 --max-time 30 --silent --show-error --output "$response_path" --write-out '%{http_code}' -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/targets/register" \
             -H 'content-type: application/json' -H "authorization: Bearer $token" \
             -d "$(jq -n --arg workspaceLocator "$WORKSPACE_LOCATOR" --arg repository "$GH_REPOSITORY" --arg repositoryId "$GH_REPOSITORY_ID" --arg repositoryOwnerId "$GH_REPOSITORY_OWNER_ID" --arg ref "$GH_REF" --arg workflow "$GH_WORKFLOW" --arg workflowRef "$GH_WORKFLOW_REF" --arg workflowSha "$GH_WORKFLOW_SHA" --arg runId "$GH_RUN_ID" --argjson runAttempt "$GH_RUN_ATTEMPT" --arg event "$GH_EVENT" --arg baseSha "$GH_BASE_SHA" --arg headSha "$GH_HEAD_SHA" --arg targetSha "$GH_TARGET_SHA" '{workspaceLocator:$workspaceLocator,repository:$repository,repositoryId:$repositoryId,repositoryOwnerId:$repositoryOwnerId,ref:$ref,workflow:$workflow,workflowRef:$workflowRef,workflowSha:$workflowSha,runId:$runId,runAttempt:$runAttempt,event:$event,baseSha:$baseSha,headSha:$headSha,targetSha:$targetSha}')")"
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Balladeer registration refused: HTTP status $status."
+            if [[ -s "$response_path" ]]; then
+              echo "Control-plane response body (first 4096 bytes):"
+              head -c 4096 -- "$response_path"
+              echo
+            else
+              echo "The control plane returned no response body."
+            fi
+            exit 1
+          fi
+          response="$(cat "$response_path")"
           target_id="$(jq -er '.targetId | select(test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))' <<<"$response")"
           manifest_digest="$(jq -er '.manifestDigest | select(test("^sha256:[a-f0-9]{64}$"))' <<<"$response")"
           challenge="$(jq -er '.challenge | select(length >= 32 and length <= 256 and test("^[A-Za-z0-9_-]+$"))' <<<"$response")"
