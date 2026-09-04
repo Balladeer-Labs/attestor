@@ -747,6 +747,48 @@ try {
   );
   await unlink(join(root, linked.junitPath));
 
+  // The link above is the easy half. The parent directory is the half a
+  // lexical containment check silently passes: `pathResolve` does not resolve
+  // symbolic links, so a declared path stays repository-relative on paper while
+  // its parent directory points somewhere else entirely, and `lstat` does not
+  // save it either because lstat declines to follow only the final component
+  // and traverses a linked directory on the way there. The runner therefore
+  // resolves the parent and checks containment on the resolved path. Without
+  // that, this run would delete and then read its verdict from outside the
+  // repository root.
+  const outsideRoot = await mkdtemp(join(tmpdir(), "balladeer-attestor-outside-"));
+  try {
+    const escapedId = scenarioId();
+    const escapedPath = `linked-reports/${escapedId}.xml`;
+    await symlink(outsideRoot, join(root, "linked-reports"));
+    // A file planted outside the repository shows what the escape would reach.
+    // The runner clears a stale document before every run, so under a lexical
+    // check this unrelated file is deleted from outside the repository root and
+    // the run then takes its verdict from there. The verifier writes nothing,
+    // so only the runner can account for the file's fate.
+    const outsideReport = join(outsideRoot, `${escapedId}.xml`);
+    await writeFile(outsideReport, junitReport({ tests: 1 }));
+    const escaped = await createPackage(escapedId, "Reports through a linked directory", {
+      source: "process.exit(0);\n",
+      results: { protocol: "junit", file: escapedPath },
+      extraArgs: [escapedPath],
+    });
+    const escapedResult = await runTarget(escaped, root, sourceSha);
+    assert.deepEqual(
+      [escapedResult.outcome, escapedResult.outcomeReason, escapedResult.custody],
+      ["custody-invalid", "custody_failed", "invalid"],
+      "a report path whose parent directory links outside the repository must be refused before the verifier runs",
+    );
+    assert.notEqual(
+      await readFile(outsideReport, "utf8").catch(() => null),
+      null,
+      "a file outside the repository root must still be there: the runner may not delete through a linked parent",
+    );
+    await unlink(join(root, "linked-reports"));
+  } finally {
+    await rm(outsideRoot, { recursive: true, force: true });
+  }
+
   // A report written inside the digest-locked promise tree would break exact
   // material closure for every later control, so the package is refused at
   // seal time rather than surfacing later as a mysterious custody failure.
