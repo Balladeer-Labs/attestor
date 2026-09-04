@@ -18,8 +18,9 @@ The workflow has three deliberate boundaries:
 
 1. `register` and the publisher jobs can request OIDC but never check out customer source.
 2. `verify` and `qualify-controls` can read customer source but have no OIDC permission.
-3. The runner gives token-bearing jobs only normalized outcomes and SHA-256 digests. It
-   does not send paths, prompts, logs, raw stdout/stderr, fixtures, or source to Balladeer.
+3. The runner gives token-bearing jobs only normalized outcomes, closed reason codes,
+   bounded example counts, and SHA-256 digests. It does not send paths, prompts, logs, raw
+   stdout/stderr, verdict documents, fixtures, or source to Balladeer.
 
 The runner invokes customer-authored verifier processes with a minimal environment. It is
 not a sandbox against a deliberately malicious process on the same GitHub runner. The
@@ -54,6 +55,28 @@ choose the repository, revision, or executable.
 
 These workflow-identity properties are unavailable on GitHub Enterprise Server, which is
 therefore outside the v0 support boundary.
+
+## The verdict document is customer-local text
+
+A verifier reports whether the behavior held, was refuted, or could not be decided by
+writing a document the runner reads: a small JSON document at the absolute path exported as
+`BALLADEER_RESULT_PATH` (`native`), or its ordinary JUnit report at the path the package
+declares (`junit`). Its bytes are customer-local, exactly like stdout and stderr.
+
+The runner reads one enum and three bounded integers out of that document and records the
+SHA-256 digest of its bytes. It never reads an element's text, a failure message, or a test
+name, and it uses no XML or parsing library to do so, which is why the runner still imports
+nothing but `node:` modules. The document itself is never published, digested into a
+payload as content, or echoed as a workflow command.
+
+The path is constrained rather than trusted. The runner chooses the `native` path itself,
+outside the repository, so nothing is written into the digest-locked promise tree. A
+declared `junit` path is resolved against the command's own working directory, refused if
+it escapes the checkout or if it or its parent is a symbolic link, refused at seal time if
+it lies under `.continuity/promises/`, and deleted both before the process starts and after
+it is read. Deleting it first is what makes absence meaningful: a document present after the
+process exits was written by this run, not replayed from the last one. A file larger than
+16 MiB is `errored`, never truncated into a verdict.
 
 ## Verifier output goes to the customer's own log
 

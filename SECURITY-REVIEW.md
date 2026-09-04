@@ -70,6 +70,19 @@ For the exact candidate SHA, review or exercise every applicable category:
   manifest expected, that no verifier ran for it, and that the advisory check still fails
   when any result is not a pass. Isolation must never let a run execute a package the
   manifest did not name.
+- **Crash versus refusal:** confirm a verifier that cannot produce a verdict is never
+  reported as a pass and never as a refutation. Exercise, for the target run and for the
+  known-bad control, a crash at import, a missing interpreter, a wall-clock timeout, a
+  fatal signal, an output flood, a declared protocol that wrote no document, a truncated
+  document, a document claiming a pass while the process exited non-zero, a suite that
+  reported zero tests, and a suite that skipped every test. Each must be `errored` or
+  `timed_out` with the reason code that names it, and the known-bad control's crash must
+  leave the package unqualified. Confirm the result document is deleted before the process
+  starts, so a report left by a previous run cannot be replayed as this run's verdict, and
+  that a document path escaping the checkout or reached through a symbolic link is
+  `custody-invalid`. Confirm the document's text never reaches a published field, an
+  annotation, or standard output, and that no XML or parsing library was added to read it.
+  Confirm an exit-code-only package can still pass but can never claim a refutation.
 - **Protocol binding and replay:** exercise a good run plus wrong repository/owner IDs,
   wrong caller ref or workflow, wrong target/source SHA, stale or reused challenge,
   mismatched manifest/package digests, incomplete results, and a revoked attestor release.

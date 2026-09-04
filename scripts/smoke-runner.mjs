@@ -8,6 +8,7 @@ import {
   buildQualificationRequest,
   canonicalize,
   packageDigest,
+  qualificationSummary,
   runAll,
   runTamperControl,
   runTarget,
@@ -16,6 +17,7 @@ import {
   sha256,
   validateExecutionManifest,
   validatePackage,
+  validateResult,
 } from "../release/continuity-runner/index.js";
 
 const root = await mkdtemp(join(tmpdir(), "balladeer-attestor-smoke-"));
@@ -24,7 +26,10 @@ const sourceSha = "a".repeat(40);
 // the digests and the echoed log lines are the same on every run.
 const verifierStdout = "raw customer output\n";
 const verifierStderr = "customer diagnostic line\n";
-const verifierSource = `import { closeSync, openSync, unlinkSync } from "node:fs";
+// It reports its verdict through the native result protocol, which is the whole
+// of that protocol: one small JSON document at the path the runner exports, no
+// Balladeer dependency, no import beyond node:fs, no network.
+const verifierSource = `import { closeSync, openSync, unlinkSync, writeFileSync } from "node:fs";
 const mode = process.argv[2];
 const lock = ".continuity-shared-smoke.lock";
 let descriptor;
@@ -35,7 +40,13 @@ process.stderr.write(${JSON.stringify(verifierStderr)});
 setTimeout(() => {
   closeSync(descriptor);
   unlinkSync(lock);
-  process.exit(mode === "bad" ? 1 : 0);
+  const refuted = mode === "bad" ? 1 : 0;
+  writeFileSync(process.env.BALLADEER_RESULT_PATH, JSON.stringify({
+    schemaVersion: "continuity-verifier-result/v1",
+    outcome: refuted ? "refuted" : "passed",
+    examples: { total: 1, refuted, errored: 0 },
+  }));
+  process.exit(refuted);
 }, 150);
 `;
 
@@ -47,13 +58,19 @@ const publishedResultKeys = [
   "control",
   "custody",
   "durationMs",
+  "exampleRefuted",
+  "exampleTotal",
   "exitCode",
   "outcome",
+  "outcomeReason",
   "packageDigest",
   "promiseId",
   "resultDigest",
+  "resultDocumentDigest",
+  "resultProtocol",
   "runnerVersion",
   "schemaVersion",
+  "signal",
   "sourceSha",
   "startedAt",
   "stderrDigest",
@@ -80,15 +97,26 @@ const meaningFor = (label) => ({
   scope: { repositoryId: "repository-smoke", surfaces: ["checkout"], labels: [] },
 });
 
-async function createPackage(promiseId, label) {
+async function createPackage(promiseId, label, options = {}) {
+  const {
+    source = verifierSource,
+    results = { protocol: "native" },
+    executable = process.execPath,
+    timeoutMs,
+    extraArgs = [],
+  } = options;
   const promiseRoot = `.continuity/promises/${promiseId}`;
   const verifierPath = `${promiseRoot}/verifier.mjs`;
   const fixturePath = `${promiseRoot}/fixture.json`;
   await mkdir(join(root, promiseRoot), { recursive: true });
-  await writeFile(join(root, verifierPath), verifierSource);
+  await writeFile(join(root, verifierPath), source);
   await writeFile(join(root, fixturePath), `{"case":"${label}"}\n`);
   const meaning = meaningFor(label);
-  const command = (mode) => ({ executable: process.execPath, args: [verifierPath, mode] });
+  const command = (mode) => ({
+    executable,
+    args: [verifierPath, mode, ...extraArgs],
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
   const base = {
     schemaVersion: "continuity-package/v1",
     promise: {
@@ -103,6 +131,7 @@ async function createPackage(promiseId, label) {
       bad: command("bad"),
       refactor: command("refactor"),
     },
+    ...(results ? { results } : {}),
     materials: [
       {
         path: verifierPath,
@@ -132,15 +161,31 @@ try {
   assert.equal(target.stdoutDigest, sha256(verifierStdout));
   assert.equal(target.stderrDigest, sha256(verifierStderr));
 
+  assert.equal(target.outcomeReason, null);
+  assert.equal(target.resultProtocol, "native");
+  assert.equal(target.exampleTotal, 1);
+  assert.equal(target.exampleRefuted, 0);
+  assert.match(target.resultDocumentDigest, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(target.schemaVersion, "continuity-result/v2");
+  // The sealed package keeps its own schema and its own digest. A result
+  // protocol change must never invalidate sealed customer material.
+  assert.equal(pkg.schemaVersion, "continuity-package/v1");
+
+  // The verifier discriminates: the known-bad control is refuted, not merely
+  // "not a pass". The three controls run serially in one execution root, and
+  // exact material closure is re-checked before each of them, so a run that
+  // survives all three also proves the native document is not written inside
+  // the digest-locked promise tree.
   const controls = await runAll(pkg, root, sourceSha);
   assert.deepEqual(
-    controls.map((result) => [result.control, result.outcome]),
+    controls.map((result) => [result.control, result.outcome, result.outcomeReason]),
     [
-      ["good", "pass"],
-      ["bad", "pass"],
-      ["refactor", "pass"],
+      ["good", "pass", null],
+      ["bad", "refuted", null],
+      ["refactor", "pass", null],
     ],
   );
+  assert.equal(controls[1].exampleRefuted, 1);
   assert.deepEqual(
     (await runTargetPackages([pkg, second], root, sourceSha)).map((result) => result.outcome),
     ["pass", "pass"],
@@ -151,6 +196,7 @@ try {
     schemaVersion: pkg.schemaVersion,
     promise: pkg.promise,
     verifier: pkg.verifier,
+    results: pkg.results,
     materials: pkg.materials.map(({ path, kind }) => ({ path, kind })),
   };
   assert.equal((await sealPackageDraft(draft, root)).packageDigest, pkg.packageDigest);
@@ -194,17 +240,24 @@ try {
   for (const [control, published] of Object.entries(qualification.controls)) {
     assert.deepEqual(
       Object.keys(published).sort(),
-      ["outcome", "resultDigest"],
-      `qualification control ${control} must publish exactly outcome and resultDigest`,
+      control === "tamper"
+        ? ["outcome", "resultDigest"]
+        : ["outcome", "outcomeReason", "resultDigest"],
+      `qualification control ${control} must publish exactly its closed pair`,
     );
     assert.match(published.resultDigest, /^sha256:[a-f0-9]{64}$/);
   }
   assert.equal(qualification.controls.tamper.outcome, "detected");
-  // `bad` is published as the observed behavior, so a correctly caught
-  // known-bad case is reported as `fail`, not as the local control's `pass`.
+  // Every control publishes what its verifier reported, read literally. The
+  // known-bad control is no longer inverted: it says `refuted` because the
+  // verifier refused the behavior, which a crashed control could never say.
   assert.deepEqual(
     ["good", "bad", "refactor"].map((control) => qualification.controls[control].outcome),
-    ["pass", "fail", "pass"],
+    ["pass", "refuted", "pass"],
+  );
+  assert.deepEqual(
+    ["good", "bad", "refactor"].map((control) => qualification.controls[control].outcomeReason),
+    [null, null, null],
   );
 
   // A customer who reads a red check must find words next to it. The runner
@@ -447,6 +500,399 @@ try {
     sourceSha: null,
     results: [],
   });
+
+  // -------------------------------------------------------------------------
+  // A crash is not a refusal, and a refusal is not a crash.
+  //
+  // One fixture per row of the runner's derivation order. Each asserts the
+  // outcome AND the reason code, because the reason is what a person reads
+  // next to a red check and what the control plane records as the limitation.
+  // Before this protocol every one of these rows exited non-zero and was
+  // therefore indistinguishable from a caught regression.
+  // -------------------------------------------------------------------------
+  await mkdir(join(root, ".continuity/reports"), { recursive: true });
+  let scenarioSequence = 0;
+  const scenarioId = () => `prom_scenario${String(++scenarioSequence).padStart(4, "0")}`;
+
+  const nativeWriter = (document, exitCode = 0) =>
+    `import { writeFileSync } from "node:fs";\n` +
+    `writeFileSync(process.env.BALLADEER_RESULT_PATH, ${JSON.stringify(document)});\n` +
+    `process.exit(${exitCode});\n`;
+  const nativeDocument = (outcome, examples) =>
+    JSON.stringify({ schemaVersion: "continuity-verifier-result/v1", outcome, examples });
+  const junitWriter = (report, exitCode = 0) =>
+    `import { writeFileSync } from "node:fs";\n` +
+    `writeFileSync(process.argv[3], ${JSON.stringify(report)});\n` +
+    `process.exit(${exitCode});\n`;
+  const junitReport = ({ tests, failures = 0, errors = 0, skipped = 0 }) =>
+    `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="smoke" tests="${tests}" failures="${failures}" errors="${errors}" skipped="${skipped}">\n<testsuite name="suite" tests="${tests}" failures="${failures}" errors="${errors}" skipped="${skipped}"></testsuite>\n</testsuites>\n`;
+
+  // Run one control of a purpose-built package and report what the runner made
+  // of it. The label is the row of the derivation order being exercised.
+  const scenario = async (label, options) => {
+    const promiseId = scenarioId();
+    const junitPath = `.continuity/reports/${promiseId}.xml`;
+    const built = await createPackage(promiseId, label, {
+      ...options,
+      ...(options.junit
+        ? { results: { protocol: "junit", file: junitPath }, extraArgs: [junitPath] }
+        : {}),
+    });
+    return { package: built, junitPath, result: await runTarget(built, root, sourceSha) };
+  };
+  const assertScenario = async (label, options, outcome, outcomeReason) => {
+    const { result } = await scenario(label, options);
+    assert.deepEqual(
+      [result.outcome, result.outcomeReason],
+      [outcome, outcomeReason],
+      `${label} must be ${outcome} / ${outcomeReason}, got ${result.outcome} / ${result.outcomeReason}`,
+    );
+    return result;
+  };
+
+  // A verifier that crashes at import reports `errored`, never `refuted` and
+  // never a pass. This one row is the whole point of the protocol.
+  const crashScenario = await scenario("Crash at import", {
+    source: 'import "./missing-dependency.mjs";\n',
+  });
+  const crashed = crashScenario.result;
+  assert.deepEqual([crashed.outcome, crashed.outcomeReason], ["errored", "nonzero_exit"]);
+  assert.equal(crashed.exampleTotal, null);
+  assert.equal(crashed.resultDocumentDigest, null);
+
+  const unspawnable = await assertScenario(
+    "Missing interpreter",
+    { source: "process.exit(0);\n", executable: "/nonexistent-balladeer-path/node" },
+    "errored",
+    "spawn_failed",
+  );
+  assert.equal(unspawnable.exitCode, null);
+  assert.equal(unspawnable.signal, null);
+
+  const timedOut = await assertScenario(
+    "Sleeps past its budget",
+    { source: "setTimeout(() => {}, 30000);\n", timeoutMs: 250 },
+    "timed_out",
+    "timeout",
+  );
+  assert.equal(timedOut.exitCode, null);
+
+  // A segmentation fault used to read as `canceled`, which spent an
+  // evidence-lifecycle word on a crash.
+  const signalled = await assertScenario(
+    "Killed by a signal",
+    { source: 'process.kill(process.pid, "SIGSEGV");\nsetTimeout(() => {}, 30000);\n' },
+    "errored",
+    "signal_killed",
+  );
+  assert.equal(signalled.signal, "SIGSEGV");
+
+  // The echo of a flooding verifier is the point of the bound, and it is
+  // already exercised elsewhere; here only the outcome matters, so the echoed
+  // megabyte is kept out of this script's own output.
+  const echoed = process.stderr.write.bind(process.stderr);
+  let flooded;
+  try {
+    process.stderr.write = () => true;
+    flooded = await assertScenario(
+      "Floods the log",
+      {
+        source: 'process.stdout.write("x".repeat(1_200_000));\nsetTimeout(() => {}, 30000);\n',
+      },
+      "errored",
+      "output_limit",
+    );
+  } finally {
+    process.stderr.write = echoed;
+  }
+  assert.equal(flooded.exitCode, null);
+
+  await assertScenario(
+    "Declares a protocol and writes nothing",
+    { source: "process.exit(0);\n" },
+    "errored",
+    "result_missing",
+  );
+  await assertScenario(
+    "Writes a truncated document",
+    {
+      source: nativeWriter('{"schemaVersion":"continuity-verifier-result/v1","outcome":"pas'),
+    },
+    "errored",
+    "result_unparseable",
+  );
+  await assertScenario(
+    "Claims a pass while exiting non-zero",
+    {
+      source: nativeWriter(
+        nativeDocument("passed", { total: 3, refuted: 0, errored: 0 }),
+        1,
+      ),
+    },
+    "errored",
+    "result_disagrees_exit",
+  );
+  await assertScenario(
+    "Reports its own error",
+    {
+      source: nativeWriter(nativeDocument("errored", { total: 2, refuted: 0, errored: 2 })),
+    },
+    "errored",
+    "verifier_reported_error",
+  );
+  await assertScenario(
+    "Ran no examples",
+    { source: nativeWriter(nativeDocument("passed", { total: 0, refuted: 0, errored: 0 })) },
+    "errored",
+    "no_examples_ran",
+  );
+  const nativeRefuted = await assertScenario(
+    "Refutes through the native protocol",
+    {
+      source: nativeWriter(nativeDocument("refuted", { total: 4, refuted: 1, errored: 0 }), 1),
+    },
+    "refuted",
+    null,
+  );
+  assert.equal(nativeRefuted.exampleTotal, 4);
+  assert.equal(nativeRefuted.exampleRefuted, 1);
+
+  // An ordinary test runner's JUnit report, read for three integers and
+  // nothing else: no name, no message, no element text.
+  const junitRefuted = await assertScenario(
+    "JUnit reports a failure",
+    { junit: true, source: junitWriter(junitReport({ tests: 5, failures: 1 }), 1) },
+    "refuted",
+    null,
+  );
+  assert.equal(junitRefuted.exampleTotal, 5);
+  assert.equal(junitRefuted.exampleRefuted, 1);
+  assert.equal(junitRefuted.resultProtocol, "junit");
+  // A pipeline that swallows the exit status still reports a caught
+  // regression. Understating health is safe; calling a real refutation
+  // "the check could not run" is not.
+  await assertScenario(
+    "JUnit reports a failure while exiting zero",
+    { junit: true, source: junitWriter(junitReport({ tests: 5, failures: 1 }), 0) },
+    "refuted",
+    null,
+  );
+  await assertScenario(
+    "JUnit reports an error",
+    { junit: true, source: junitWriter(junitReport({ tests: 5, errors: 1 }), 1) },
+    "errored",
+    "verifier_reported_error",
+  );
+  await assertScenario(
+    "JUnit reports no tests",
+    { junit: true, source: junitWriter(junitReport({ tests: 0 })) },
+    "errored",
+    "no_examples_ran",
+  );
+  // Every example skipped is not a green suite. It is a suite that exercised
+  // nothing, which is the same failure class as a crash reading as a pass.
+  await assertScenario(
+    "JUnit skipped every test",
+    { junit: true, source: junitWriter(junitReport({ tests: 4, skipped: 4 })) },
+    "errored",
+    "no_examples_ran",
+  );
+
+  // Silence degrades to Unknown, never to a false pass, and can never claim a
+  // refutation. That is the migration forcing function.
+  const undeclared = await createPackage(scenarioId(), "Declares no protocol", {
+    source: "process.exit(1);\n",
+    results: null,
+  });
+  const undeclaredResult = await runTarget(undeclared, root, sourceSha);
+  assert.deepEqual(
+    [undeclaredResult.outcome, undeclaredResult.outcomeReason, undeclaredResult.resultProtocol],
+    ["errored", "protocol_undeclared", "exit-code-only"],
+  );
+  const undeclaredPass = await createPackage(scenarioId(), "Declares no protocol", {
+    source: "process.exit(0);\n",
+    results: null,
+  });
+  assert.equal((await runTarget(undeclaredPass, root, sourceSha)).outcome, "pass");
+
+  // A document left by an earlier run is a replay vector. The runner deletes
+  // the declared path before the process starts, so a verifier that writes
+  // nothing is reported as having written nothing.
+  const stale = await scenario("Leaves a stale report", {
+    junit: true,
+    source: "process.exit(0);\n",
+  });
+  await writeFile(join(root, stale.junitPath), junitReport({ tests: 9 }));
+  const staleResult = await runTarget(stale.package, root, sourceSha);
+  assert.deepEqual(
+    [staleResult.outcome, staleResult.outcomeReason],
+    ["errored", "result_missing"],
+    "a stale report from a previous run must not be read as this run's verdict",
+  );
+
+  // The declared report path gets the same custody treatment as locked
+  // material: a symbolic link is refused rather than followed.
+  const linked = await scenario("Links its report out of the tree", {
+    junit: true,
+    source: junitWriter(junitReport({ tests: 1 })),
+  });
+  // The runner deletes the report after reading it, so this path is already
+  // free; the guard keeps the fixture honest if that ever changes.
+  await unlink(join(root, linked.junitPath)).catch(() => undefined);
+  await symlink(join(root, "outside-report.xml"), join(root, linked.junitPath));
+  const linkedResult = await runTarget(linked.package, root, sourceSha);
+  assert.deepEqual(
+    [linkedResult.outcome, linkedResult.outcomeReason, linkedResult.custody],
+    ["custody-invalid", "custody_failed", "invalid"],
+  );
+  await unlink(join(root, linked.junitPath));
+
+  // A report written inside the digest-locked promise tree would break exact
+  // material closure for every later control, so the package is refused at
+  // seal time rather than surfacing later as a mysterious custody failure.
+  const inTree = structuredClone(linked.package);
+  inTree.results = {
+    protocol: "junit",
+    file: `.continuity/promises/${inTree.promise.id}/report.xml`,
+  };
+  inTree.packageDigest = packageDigest(inTree);
+  assert.throws(() => validatePackage(inTree), /must be outside \.continuity\/promises/);
+  const unnamedPath = structuredClone(linked.package);
+  unnamedPath.results = { protocol: "junit", file: "reports/never-named.xml" };
+  unnamedPath.packageDigest = packageDigest(unnamedPath);
+  assert.throws(() => validatePackage(unnamedPath), /must name results\.file in its arguments/);
+  const nativeWithFile = structuredClone(linked.package);
+  nativeWithFile.results = { protocol: "native", file: "reports/anything.xml" };
+  nativeWithFile.packageDigest = packageDigest(nativeWithFile);
+  assert.throws(() => validatePackage(nativeWithFile), /only used by the junit protocol/);
+
+  // The discrimination proof: a known-bad control whose verifier crashes is
+  // `errored`, so the package does not qualify. Before this, that crash was
+  // published as the pass that qualified the binding.
+  const crashOnBad = await createPackage(scenarioId(), "Crashes on the known-bad control", {
+    source:
+      'import { writeFileSync } from "node:fs";\n' +
+      'const mode = process.argv[2];\n' +
+      'if (mode === "bad") await import("./missing-dependency.mjs");\n' +
+      `writeFileSync(process.env.BALLADEER_RESULT_PATH, ${JSON.stringify(
+        nativeDocument("passed", { total: 1, refuted: 0, errored: 0 }),
+      )});\n`,
+  });
+  const crashOnBadResults = await runAll(crashOnBad, root, sourceSha);
+  assert.deepEqual(
+    crashOnBadResults.map((result) => [result.control, result.outcome, result.outcomeReason]),
+    [
+      ["good", "pass", null],
+      ["bad", "errored", "nonzero_exit"],
+      ["refactor", "pass", null],
+    ],
+  );
+  const crashSummary = qualificationSummary([crashOnBad], crashOnBadResults);
+  assert.equal(crashSummary.allControlsDiscriminated, false);
+  assert.equal(crashSummary.undecidedControls, 1);
+  const crashReceipt = await buildQualificationRequest(
+    crashOnBad,
+    {
+      schemaVersion: "continuity-qualification-meta/v1",
+      workspaceLocator: "3f1d9c2a-5b64-4a7e-9c31-8d2f6a0b4e57",
+      receiptId: "7c8e1b40-2d95-4f16-a3b8-51c7e9d0af62",
+      revisionId: "rev_smoke002",
+      bindingId: "bind_smoke002",
+      workflowDigest: sha256("smoke-workflow"),
+    },
+    root,
+  );
+  assert.deepEqual(crashReceipt.controls.bad, {
+    outcome: "errored",
+    outcomeReason: "nonzero_exit",
+    resultDigest: crashReceipt.controls.bad.resultDigest,
+  });
+  assert.equal(crashReceipt.controls.good.outcome, "pass");
+
+  // What the customer sees when a verifier could not decide: a warning rather
+  // than the error a caught regression gets, the reason code named in the
+  // sentence and in the job summary, and standard output still carrying the
+  // closed result JSON and nothing else.
+  await writeSealedPackage(crashScenario.package);
+  const erroredManifestPath = await writeManifest("manifest-errored.json", [
+    {
+      id: crashScenario.package.promise.id,
+      packageDigest: crashScenario.package.packageDigest,
+    },
+  ]);
+  await writeFile(summaryPath, "");
+  const erroredRun = runManifestTarget(erroredManifestPath);
+  assert.equal(erroredRun.status, 0, erroredRun.stderr);
+  const erroredOutput = JSON.parse(erroredRun.stdout);
+  assert.equal(
+    erroredRun.stdout.trim(),
+    JSON.stringify(erroredOutput),
+    "standard output carries the closed result JSON and nothing else",
+  );
+  assert.deepEqual(
+    [erroredOutput.results[0].outcome, erroredOutput.results[0].outcomeReason],
+    ["errored", "nonzero_exit"],
+  );
+  assert.deepEqual(Object.keys(erroredOutput.results[0]).sort(), publishedResultKeys);
+  assert.match(
+    erroredRun.stderr,
+    new RegExp(
+      `::warning::${crashScenario.package.promise.id}[^\\n]*target control outcome errored \\(nonzero_exit\\)`,
+    ),
+    "a crash must not be annotated as a caught regression",
+  );
+  assert.match(erroredRun.stderr, /Reason: nonzero_exit\./);
+  const erroredSummary = await readFile(summaryPath, "utf8");
+  assert.match(erroredSummary, /\| errored \(nonzero_exit\) \|/);
+
+  // The result's own allow-list is closed. An outcome, a reason, a signal or a
+  // protocol from outside the vocabulary is refused before the digest is even
+  // considered, so no free text can ride into a published field.
+  validateResult(nativeRefuted);
+  assert.throws(
+    () => validateResult({ ...nativeRefuted, outcomeReason: "verifier_was_sad" }),
+    /outcomeReason is invalid/,
+  );
+  assert.throws(
+    () => validateResult({ ...crashed, signal: "SIGMADEUP" }),
+    /signal is invalid/,
+  );
+  assert.throws(
+    () => validateResult({ ...crashed, outcomeReason: null }),
+    /outcomeReason must be present/,
+  );
+
+  // The local gate: a package whose controls discriminate qualifies, and one
+  // whose known-bad control crashed is refused by name rather than counted as
+  // evidence that the verifier discriminates.
+  const gateDirectory = join(root, ".continuity/qualify-gate");
+  await mkdir(gateDirectory, { recursive: true });
+  const qualifyLocally = async (item) => {
+    const path = join(gateDirectory, `${item.promise.id}.json`);
+    await writeFile(path, JSON.stringify(item, null, 2) + "\n");
+    return spawnSync(process.execPath, [cliPath, "qualify", path], {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env, BALLADEER_SOURCE_SHA: sourceSha },
+    });
+  };
+  const discriminating = await createPackage(scenarioId(), "Discriminates", {
+    source:
+      'import { writeFileSync } from "node:fs";\n' +
+      'const refuted = process.argv[2] === "bad" ? 1 : 0;\n' +
+      `writeFileSync(process.env.BALLADEER_RESULT_PATH, JSON.stringify({ schemaVersion: "continuity-verifier-result/v1", outcome: refuted ? "refuted" : "passed", examples: { total: 1, refuted, errored: 0 } }));\n` +
+      "process.exit(refuted);\n",
+  });
+  const qualified = await qualifyLocally(discriminating);
+  assert.equal(qualified.status, 0, qualified.stderr);
+  const qualifiedOutput = JSON.parse(qualified.stdout);
+  assert.equal(qualifiedOutput.qualification.allControlsDiscriminated, true);
+  assert.equal(qualifiedOutput.qualification.undecidedControls, 0);
+  assert.equal(qualifiedOutput.qualification.perPromise[0].resultProtocol, "native");
+
+  const refusedGate = await qualifyLocally(crashOnBad);
+  assert.equal(refusedGate.status, 1);
+  assert.match(refusedGate.stderr, /at least one control errored, timed out, or was canceled/);
 
   console.log("prebuilt runner smoke checks passed");
 } finally {

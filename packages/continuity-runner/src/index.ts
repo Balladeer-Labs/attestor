@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendFile,
   lstat,
@@ -7,19 +7,32 @@ import {
   readFile,
   realpath,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { isAbsolute, relative, resolve as pathResolve } from "node:path";
+import { tmpdir } from "node:os";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve as pathResolve,
+} from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
+// The sealed package and the published result are versioned separately on
+// purpose. A package sealed before the verifier result protocol existed is
+// still a valid package, and its digest is unchanged, so bumping the result
+// schema must never invalidate a customer's sealed material or make every
+// promise report a changed digest.
 export const RUNNER_SCHEMA = "continuity-package/v1" as const;
+export const RESULT_SCHEMA = "continuity-result/v2" as const;
 export const RUNNER_VERSION = "0.1.0";
 export const CONTROLS = ["good", "bad", "refactor"] as const;
 export const RUN_MODES = ["target", ...CONTROLS] as const;
 export type Control = (typeof CONTROLS)[number];
 export type RunMode = (typeof RUN_MODES)[number];
-export type ControlExpectation = "pass" | "fail";
 
 export interface BehavioralExample {
   label: string;
@@ -68,10 +81,36 @@ export interface LockedMaterial {
   kind: "verifier" | "fixture" | "support";
   digest: string;
 }
+/**
+ * How a verifier reports its verdict. Exit status alone can say "the process
+ * finished" and "the process did not finish cleanly", but it cannot separate a
+ * refusal from a crash: an uncaught import error and a failed assertion both
+ * exit 1 in every mainstream test runner. A package therefore declares the
+ * document its command writes at `BALLADEER_RESULT_PATH`.
+ *
+ * `native`  the command writes one small JSON document and nothing else. The
+ *           runner chooses that path itself, under the runner temporary
+ *           directory, so the document is never a file inside the digest-locked
+ *           promise tree and can never be replayed from a previous run.
+ * `junit`   an ordinary test runner writes JUnit XML at a declared path. The
+ *           path is repository-relative to the command's working directory, is
+ *           refused inside `.continuity/promises/`, and is deleted before the
+ *           command runs and after it is read.
+ *
+ * A package with no `results` member is exit-code-only. It can report pass and
+ * errored honestly, and can never report refuted, so it cannot qualify.
+ */
+export type ResultProtocol = "native" | "junit" | "exit-code-only";
+export interface ResultSpec {
+  protocol: "native" | "junit";
+  /** JUnit only, relative to the verifier command's working directory. */
+  file?: string;
+}
 export interface AcceptancePackage {
   schemaVersion: typeof RUNNER_SCHEMA;
   promise: PromiseMeaning;
   verifier: VerifierSpec;
+  results?: ResultSpec;
   materials: LockedMaterial[];
   packageDigest: string;
 }
@@ -79,6 +118,7 @@ export interface AcceptancePackageDraft {
   schemaVersion: typeof RUNNER_SCHEMA;
   promise: PromiseMeaning;
   verifier: VerifierSpec;
+  results?: ResultSpec;
   materials: Array<Omit<LockedMaterial, "digest">>;
 }
 
@@ -105,9 +145,65 @@ export interface ScaffoldResult {
   readmePath: string;
 }
 
-export type RunOutcome = "pass" | "fail" | "unknown" | "canceled" | "custody-invalid";
+/**
+ * The closed outcome vocabulary. `fail` is retired from the wire: it meant
+ * "did not meet expectation", which is exactly the conflation this protocol
+ * removes. A crash is never a pass and is never a refutation.
+ */
+export const RUN_OUTCOMES = [
+  "pass",
+  "refuted",
+  "errored",
+  "timed_out",
+  "canceled",
+  "custody-invalid",
+] as const;
+export type RunOutcome = (typeof RUN_OUTCOMES)[number];
+
+/** Why a non-pass, non-refuted outcome could not be a verdict. */
+export const OUTCOME_REASONS = [
+  "spawn_failed",
+  "nonzero_exit",
+  "signal_killed",
+  "timeout",
+  "output_limit",
+  "result_missing",
+  "result_unparseable",
+  "result_too_large",
+  "result_disagrees_exit",
+  "verifier_reported_error",
+  "no_examples_ran",
+  "protocol_undeclared",
+  "canceled_external",
+  "custody_failed",
+] as const;
+export type OutcomeReason = (typeof OUTCOME_REASONS)[number];
+
+/**
+ * Signal names are OS-supplied strings, so they are mapped onto a closed list
+ * before they can reach a published field. Anything else is `other`.
+ */
+export const RESULT_SIGNALS = [
+  "SIGABRT",
+  "SIGBUS",
+  "SIGFPE",
+  "SIGHUP",
+  "SIGILL",
+  "SIGINT",
+  "SIGKILL",
+  "SIGPIPE",
+  "SIGQUIT",
+  "SIGSEGV",
+  "SIGTERM",
+  "other",
+] as const;
+export type ResultSignal = (typeof RESULT_SIGNALS)[number];
+
+/** The largest example count a published result may carry. */
+const exampleCountLimit = 1_000_000;
+
 export interface RunResult {
-  schemaVersion: typeof RUNNER_SCHEMA;
+  schemaVersion: typeof RESULT_SCHEMA;
   runnerVersion: string;
   promiseId: string;
   packageDigest: string;
@@ -115,10 +211,17 @@ export interface RunResult {
   sourceSha: string;
   control: RunMode;
   outcome: RunOutcome;
+  outcomeReason: OutcomeReason | null;
   exitCode: number | null;
+  signal: ResultSignal | null;
   durationMs: number;
   stdoutDigest: string;
   stderrDigest: string;
+  resultProtocol: ResultProtocol;
+  resultDocumentDigest: string | null;
+  /** Examples that actually ran, skips excluded. Null when unknown. */
+  exampleTotal: number | null;
+  exampleRefuted: number | null;
   startedAt: string;
   completedAt: string;
   custody: "local" | "invalid";
@@ -150,7 +253,18 @@ const meaningKeys = [
   "scope",
 ];
 const commandKeys = ["executable", "args", "cwd", "timeoutMs"];
-const packageKeys = ["schemaVersion", "promise", "verifier", "materials", "packageDigest"];
+const packageKeys = [
+  "schemaVersion",
+  "promise",
+  "verifier",
+  "results",
+  "materials",
+  "packageDigest",
+];
+const draftKeys = ["schemaVersion", "promise", "verifier", "results", "materials"];
+// Exactly what a published result may carry. Every entry is an enum, an
+// integer, an identifier, a timestamp, or a SHA-256 digest: no path, no
+// message, no example name, no free text.
 const resultKeys = [
   "schemaVersion",
   "runnerVersion",
@@ -159,10 +273,16 @@ const resultKeys = [
   "sourceSha",
   "control",
   "outcome",
+  "outcomeReason",
   "exitCode",
+  "signal",
   "durationMs",
   "stdoutDigest",
   "stderrDigest",
+  "resultProtocol",
+  "resultDocumentDigest",
+  "exampleTotal",
+  "exampleRefuted",
   "startedAt",
   "completedAt",
   "custody",
@@ -225,8 +345,18 @@ function assertNotRetiredManifest(input: unknown): void {
 // customer can remove a comment without having authored a verifier. Keep a
 // normalized structural fingerprint of the generated control program so that
 // whitespace/comments (including the marker itself) cannot launder it.
-const scaffoldVerifierStructure =
-  'const control = process.argv[2];process.exit(control === "bad" ? 1 : 0);';
+//
+// The starter also demonstrates the native result protocol, because that is
+// the whole of it: write one small document at the path the runner exports,
+// with no Balladeer dependency, no import beyond node:fs, and no network.
+const scaffoldVerifierSource = `import { writeFileSync } from "node:fs";
+const control = process.argv[2];
+// BALLADEER_STARTER_VERIFIER: replace this with a real customer-behavior verifier.
+const refuted = control === "bad" ? 1 : 0;
+writeFileSync(process.env.BALLADEER_RESULT_PATH, JSON.stringify({ schemaVersion: "continuity-verifier-result/v1", outcome: refuted ? "refuted" : "passed", examples: { total: 1, refuted, errored: 0 } }));
+process.exit(refuted);
+`;
+const scaffoldVerifierStructure = scaffoldVerifierSource;
 const normalizedSource = (source: string): string =>
   source
     .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -343,9 +473,56 @@ export function packageDigest(
 ): string {
   return sha256(canonicalize(withoutDigest(pkg as AcceptancePackage)));
 }
+/**
+ * Validate the optional result-protocol declaration. The JUnit path is the
+ * only customer-chosen path the runner writes to, so it is constrained here
+ * rather than at execution time: normalized and repository-relative, never
+ * inside the digest-locked promise tree (a report written there would break
+ * exact material closure for every later control), and actually named in the
+ * command that is supposed to produce it, since `spawn` runs with no shell and
+ * cannot expand `$BALLADEER_RESULT_PATH` inside an argument.
+ */
+function validateResultSpec(
+  results: unknown,
+  verifier: Record<string, unknown>,
+  promiseId: string,
+  label: string,
+): ResultSpec {
+  keysAre(results, ["protocol", "file"], `${label} results`, ["file"]);
+  const protocol = stringField(results.protocol, `${label} results.protocol`);
+  if (protocol !== "native" && protocol !== "junit")
+    throw new Error(`${label} results.protocol must be native or junit`);
+  if (protocol === "native") {
+    if (results.file !== undefined)
+      throw new Error(
+        `${label} results.file is only used by the junit protocol; the runner chooses the native document path itself`,
+      );
+    return { protocol };
+  }
+  const file = stringField(results.file, `${label} results.file`);
+  if (
+    isAbsolute(file) ||
+    file.includes("\\") ||
+    file.split("/").some((part) => part === "" || part === "." || part === "..")
+  )
+    throw new Error(`${label} results.file must be a normalized relative path`);
+  if (file.startsWith(".continuity/promises/"))
+    throw new Error(
+      `${label} results.file must be outside .continuity/promises/${promiseId}, because a report written inside the promise tree breaks exact material closure`,
+    );
+  for (const control of RUN_MODES) {
+    const command = verifier[control] as VerifierCommand | undefined;
+    if (!command?.args.some((argument) => argument.includes(file)))
+      throw new Error(
+        `${label} verifier.${control} must name results.file in its arguments, because the runner spawns it without a shell`,
+      );
+  }
+  return { protocol, file };
+}
+
 export function validatePackage(input: unknown): AcceptancePackage {
   assertNotRetiredShape(input, "package");
-  keysAre(input, packageKeys, "package");
+  keysAre(input, packageKeys, "package", ["results"]);
   if (input.schemaVersion !== RUNNER_SCHEMA)
     throw new Error(`package.schemaVersion must be ${RUNNER_SCHEMA}`);
   keysAre(input.promise, meaningKeys, "promise");
@@ -384,6 +561,13 @@ export function validatePackage(input: unknown): AcceptancePackage {
     )
       throw new Error(`verifier.${control}.timeoutMs out of range`);
   }
+  if (input.results !== undefined)
+    validateResultSpec(
+      input.results,
+      input.verifier as Record<string, unknown>,
+      promiseId,
+      "package",
+    );
   if (!Array.isArray(input.materials) || input.materials.length < 2 || input.materials.length > 256)
     throw new Error("materials must contain between 2 and 256 locked files");
   const materialPaths = new Set<string>();
@@ -561,7 +745,7 @@ export async function sealPackageDraft(
   executionRoot = process.cwd(),
 ): Promise<AcceptancePackage> {
   assertNotRetiredShape(input, "package draft");
-  keysAre(input, ["schemaVersion", "promise", "verifier", "materials"], "package draft");
+  keysAre(input, draftKeys, "package draft", ["results"]);
   if (!Array.isArray(input.materials)) throw new Error("package draft materials must be an array");
   if (!input.promise || typeof input.promise !== "object" || Array.isArray(input.promise))
     throw new Error("package draft promise must be an object");
@@ -628,6 +812,7 @@ export async function sealPackageDraft(
     schemaVersion: input.schemaVersion,
     promise: input.promise,
     verifier: input.verifier,
+    ...(input.results === undefined ? {} : { results: input.results }),
     materials,
   } as Omit<AcceptancePackage, "packageDigest">;
   return validatePackage({ ...base, packageDigest: packageDigest(base) });
@@ -778,18 +963,17 @@ export async function buildQualificationRequest(
   const result = (control: Control) => {
     const item = byControl.get(control);
     if (!item) throw new Error(`qualification result is missing ${control}`);
-    // The local runner reports whether the control's expectation passed. The
-    // qualification API records the observed behavior: the known-bad control
-    // is therefore represented as `fail` when its expected non-zero command
-    // exited as expected.
-    const observedOutcome = item.outcome === "custody-invalid" ? "unknown" : item.outcome;
-    const outcome =
-      control === "bad" && observedOutcome === "pass"
-        ? "fail"
-        : control === "bad" && observedOutcome === "fail"
-          ? "pass"
-          : observedOutcome;
-    return { outcome, resultDigest: item.resultDigest };
+    // Every control now publishes what its verifier actually reported. The
+    // known-bad control is no longer inverted: it publishes `refuted` when its
+    // verifier refuted the behavior, and the receipt is read literally. An
+    // inversion could only ever say "this control did not do what a passing
+    // control does", which a crash satisfies just as well as a refusal.
+    const outcome = item.outcome === "custody-invalid" ? "unknown" : item.outcome;
+    return {
+      outcome,
+      outcomeReason: item.outcome === "custody-invalid" ? "custody_failed" : item.outcomeReason,
+      resultDigest: item.resultDigest,
+    };
   };
   return {
     schemaVersion: "continuity-qualification/v1",
@@ -923,14 +1107,15 @@ export async function scaffoldPackage(
       bad: { executable: "node", args: [verifierPath, "bad"] },
       refactor: { executable: "node", args: [verifierPath, "refactor"] },
     },
+    results: { protocol: "native" as const },
     materials: [
       { path: verifierPath, kind: "verifier" as const },
       { path: fixturePath, kind: "fixture" as const },
     ],
   };
-  const verifier = `const control = process.argv[2];\n// BALLADEER_STARTER_VERIFIER: replace this with a real customer-behavior verifier.\nprocess.exit(control === "bad" ? 1 : 0);\n`;
+  const verifier = scaffoldVerifierSource;
   const fixture = '{\n  "replaceMe": true\n}\n';
-  const readme = `# Continuity starter\n\nThis directory was generated locally for **${promiseId}**. It is an authoring starter, not a protected behavior.\n\n1. Replace every placeholder in drafts/${promiseId}.json.\n2. Replace promises/${promiseId}/verifier.mjs with a real verifier and update promises/${promiseId}/fixture.json. The starter verifier only demonstrates control wiring.\n3. From the repository root, seal it into ${outputPath}/packages/${promiseId}.json:\n\n   continuity-runner seal ${draftPath} ${outputPath}/packages/${promiseId}.json\n\nThe seal command refuses to overwrite an existing output. Run the local qualification controls before asking the Balladeer owner to activate the package. No source, fixture contents, or verifier output is sent to Balladeer; only closed digests and normalized outcomes are publishable.\n`;
+  const readme = `# Continuity starter\n\nThis directory was generated locally for **${promiseId}**. It is an authoring starter, not a protected behavior.\n\n1. Replace every placeholder in drafts/${promiseId}.json.\n2. Replace promises/${promiseId}/verifier.mjs with a real verifier and update promises/${promiseId}/fixture.json. The starter verifier only demonstrates control wiring and the native result protocol: it writes {"schemaVersion":"continuity-verifier-result/v1","outcome":"passed"|"refuted"|"errored","examples":{"total":N,"refuted":N,"errored":N}} at the BALLADEER_RESULT_PATH the runner exports. A verifier that reports nothing there can never say a behavior was refuted, so its package can never qualify.\n3. From the repository root, seal it into ${outputPath}/packages/${promiseId}.json:\n\n   continuity-runner seal ${draftPath} ${outputPath}/packages/${promiseId}.json\n\nThe seal command refuses to overwrite an existing output. Run the local qualification controls before asking the Balladeer owner to activate the package. No source, fixture contents, or verifier output is sent to Balladeer; only closed digests and normalized outcomes are publishable.\n`;
   await mkdir(pathResolve(root, promiseRoot), { recursive: true });
   await mkdir(pathResolve(root, `${outputPath}/drafts`), { recursive: true });
   await mkdir(pathResolve(root, `${outputPath}/packages`), { recursive: true });
@@ -1049,8 +1234,12 @@ export async function runManifestEntries(
               new Date(),
               sourceSha,
               "custody-invalid",
+              "custody_failed",
               null,
               "invalid",
+              // No package answered for this promise, so no result protocol was
+              // used. The custody outcome is what the row is about.
+              "exit-code-only",
             ),
       );
   return results;
@@ -1059,9 +1248,10 @@ export async function runManifestEntries(
 function digestStream(value: string): string {
   return sha256(value);
 }
-function expectedFor(control: RunMode, exitCode: number | null): boolean {
-  return control === "bad" ? exitCode !== 0 : exitCode === 0;
-}
+// The control mode deliberately takes no part in the verdict. There is no
+// function here mapping a mode to the exit status it expected: a control
+// reports what its verifier said, and whether the known-bad control was
+// supposed to be refuted is a qualification question, not a runner one.
 function resultDigest(result: Omit<RunResult, "resultDigest"> | RunResult): string {
   return sha256(canonicalize(resultWithoutDigest(result as RunResult)));
 }
@@ -1104,11 +1294,35 @@ export async function verifyLockedMaterials(
 
 export function validateResult(input: unknown): RunResult {
   keysAre(input, resultKeys, "result");
-  if (input.schemaVersion !== RUNNER_SCHEMA)
-    throw new Error(`result.schemaVersion must be ${RUNNER_SCHEMA}`);
+  if (input.schemaVersion !== RESULT_SCHEMA)
+    throw new Error(`result.schemaVersion must be ${RESULT_SCHEMA}`);
   if (!RUN_MODES.includes(input.control as RunMode)) throw new Error("result.control is invalid");
-  if (!["pass", "fail", "unknown", "canceled", "custody-invalid"].includes(input.outcome as string))
+  if (!RUN_OUTCOMES.includes(input.outcome as RunOutcome))
     throw new Error("result.outcome is invalid");
+  if (
+    input.outcomeReason !== null &&
+    !OUTCOME_REASONS.includes(input.outcomeReason as OutcomeReason)
+  )
+    throw new Error("result.outcomeReason is invalid");
+  if ((input.outcome === "pass" || input.outcome === "refuted") !== (input.outcomeReason === null))
+    throw new Error("result.outcomeReason must be present for every outcome but pass and refuted");
+  if (input.signal !== null && !RESULT_SIGNALS.includes(input.signal as ResultSignal))
+    throw new Error("result.signal is invalid");
+  if (!["native", "junit", "exit-code-only"].includes(input.resultProtocol as string))
+    throw new Error("result.resultProtocol is invalid");
+  if (input.resultDocumentDigest !== null)
+    digestField(input.resultDocumentDigest, "result.resultDocumentDigest");
+  for (const key of ["exampleTotal", "exampleRefuted"]) {
+    const value = input[key];
+    if (
+      value !== null &&
+      (typeof value !== "number" ||
+        !Number.isSafeInteger(value) ||
+        value < 0 ||
+        value > exampleCountLimit)
+    )
+      throw new Error(`result.${key} is invalid`);
+  }
   stringField(input.promiseId, "result.promiseId");
   digestField(input.packageDigest, "result.packageDigest");
   if (!isGitSha(input.sourceSha))
@@ -1165,7 +1379,7 @@ function humanLine(text: string): void {
   process.stderr.write(`${humanPrefix} ${text}\n`);
 }
 
-function annotate(level: "notice" | "error", message: string): void {
+function annotate(level: "notice" | "warning" | "error", message: string): void {
   if (process.env.GITHUB_ACTIONS !== "true") return;
   // GitHub decodes %25, %0A, and %0D inside an annotation message. The message
   // has already lost every control character, so only the escape character
@@ -1238,6 +1452,12 @@ function unavailableExplanation(reason: PackageUnavailableReason): string {
 
 const summaryLimit = 65_536;
 
+function annotationLevel(outcome: RunOutcome): "notice" | "warning" | "error" {
+  if (outcome === "pass") return "notice";
+  if (outcome === "refuted" || outcome === "custody-invalid") return "error";
+  return "warning";
+}
+
 async function appendJobSummary(rows: string[]): Promise<void> {
   const path = process.env.GITHUB_STEP_SUMMARY;
   if (!path || rows.length === 0) return;
@@ -1285,18 +1505,25 @@ export async function announceRun(
     const reason = selection?.kind === "unavailable" ? unavailableExplanation(selection.reason) : "";
     const promiseId = loggable(result.promiseId, 80);
     const subject = title === "" ? promiseId : `${promiseId} (${title})`;
-    const detail =
+    const context =
       reason !== ""
         ? reason
         : approvedOutcome === ""
           ? ""
           : `Approved observable outcome: ${approvedOutcome}`;
-    const sentence = `${subject}: ${result.control} control outcome ${result.outcome}.${detail === "" ? "" : ` ${detail}`}`;
+    // The reason code says which kind of not-pass this is, so a person reading
+    // the log is never left to guess whether the behavior broke or the check
+    // could not run.
+    const outcomeReason = result.outcomeReason === null ? "" : `Reason: ${result.outcomeReason}.`;
+    const detail = [outcomeReason, context].filter((part) => part !== "").join(" ");
+    const named = `${result.outcome}${result.outcomeReason === null ? "" : ` (${result.outcomeReason})`}`;
+    const sentence = `${subject}: ${result.control} control outcome ${named}.${detail === "" ? "" : ` ${detail}`}`;
     humanLine(sentence);
-    annotate(result.outcome === "pass" ? "notice" : "error", sentence);
-    rows.push(
-      `| ${cell(subject, 240)} | ${result.control} | ${result.outcome} | ${cell(detail, 240)} |`,
-    );
+    // Only a refutation is a caught regression. A crash, a timeout, or a
+    // cancellation is a warning: it never blames the customer's code for
+    // breaking a behavior nobody managed to check.
+    annotate(annotationLevel(result.outcome), sentence);
+    rows.push(`| ${cell(subject, 240)} | ${result.control} | ${named} | ${cell(detail, 240)} |`);
   }
   await appendJobSummary(rows);
 }
@@ -1306,9 +1533,15 @@ export async function announceRun(
  * environment, not the Actions control plane: in particular they must never
  * inherit OIDC, GitHub file-command, artifact, runner, or checkout metadata.
  * There is intentionally no package-level arbitrary env passthrough.
+ *
+ * `BALLADEER_RESULT_PATH` is the one variable the runner adds, and only when
+ * the package declares a result protocol. It names the absolute path the
+ * verifier writes its verdict document to. It is not a passthrough: the runner
+ * chooses the value.
  */
 export function verifierEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
+  resultPath?: string,
 ): Record<string, string> {
   const allowed = [
     "PATH",
@@ -1327,7 +1560,214 @@ export function verifierEnvironment(
     const value = environment[key];
     if (typeof value === "string" && value.length > 0) clean[key] = value;
   }
+  if (resultPath) clean.BALLADEER_RESULT_PATH = resultPath;
   return clean;
+}
+
+// ---------------------------------------------------------------------------
+// Reading a verifier's verdict document.
+//
+// The document is read for four enums and three integers. No element text, no
+// failure message, no test name, and no path is ever read out of it, so the
+// runner still imports nothing but node: modules and nothing a customer wrote
+// can travel further than a count. Its bytes are digested so that the control
+// plane can bind the verdict to the document that produced it, and the bytes
+// themselves never leave the customer's runner.
+// ---------------------------------------------------------------------------
+
+/** The same 16 MiB bound the locked-material check already uses. */
+const resultDocumentLimit = 16 * 1024 * 1024;
+const junitRootScanLimit = 64 * 1024;
+const junitSuiteLimit = 10_000;
+
+interface ExampleCounts {
+  /** Examples that actually ran. A skipped example did not run. */
+  executed: number;
+  refuted: number;
+  errored: number;
+}
+type DocumentVerdict = "passed" | "refuted" | "errored";
+type DocumentReading =
+  | { kind: "absent" }
+  | { kind: "too_large" }
+  | { kind: "unreadable" }
+  | { kind: "unparseable"; digest: string }
+  | { kind: "verdict"; digest: string; outcome: DocumentVerdict; counts: ExampleCounts };
+
+function boundedCount(value: unknown): number | undefined {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > exampleCountLimit
+  )
+    return undefined;
+  return value;
+}
+
+function countAttribute(
+  element: string,
+  name: "tests" | "failures" | "errors" | "skipped",
+): number | undefined {
+  const match = new RegExp(`\\s${name}="([^"]*)"`).exec(element);
+  if (!match) return undefined;
+  const text = match[1]!.trim();
+  if (!/^[0-9]{1,7}$/.test(text)) return undefined;
+  return boundedCount(Number(text));
+}
+
+function junitCounts(
+  text: string,
+): { outcome: DocumentVerdict; counts: ExampleCounts } | undefined {
+  const totals = { tests: 0, failures: 0, errors: 0, skipped: 0 };
+  const root = /<testsuites\b[^>]*>/.exec(text.slice(0, junitRootScanLimit));
+  const suites = root && countAttribute(root[0], "tests") !== undefined
+    ? [root[0]]
+    : text.match(/<testsuite\b[^>]*>/g) ?? [];
+  if (suites.length === 0 || suites.length > junitSuiteLimit) return undefined;
+  for (const suite of suites) {
+    const tests = countAttribute(suite, "tests");
+    if (tests === undefined) return undefined;
+    const failures = countAttribute(suite, "failures") ?? 0;
+    const errors = countAttribute(suite, "errors") ?? 0;
+    const skipped = countAttribute(suite, "skipped") ?? 0;
+    if (skipped > tests) return undefined;
+    totals.tests += tests;
+    totals.failures += failures;
+    totals.errors += errors;
+    totals.skipped += skipped;
+  }
+  if (Object.values(totals).some((value) => boundedCount(value) === undefined)) return undefined;
+  // A suite that reports errors did not decide the behavior, whatever else it
+  // reports. A suite that reports failures and no errors refuted it.
+  const outcome: DocumentVerdict =
+    totals.errors > 0 ? "errored" : totals.failures > 0 ? "refuted" : "passed";
+  return {
+    outcome,
+    counts: {
+      executed: totals.tests - totals.skipped,
+      refuted: totals.failures,
+      errored: totals.errors,
+    },
+  };
+}
+
+function nativeCounts(
+  text: string,
+): { outcome: DocumentVerdict; counts: ExampleCounts } | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const document = parsed as Record<string, unknown>;
+  for (const key of Object.keys(document))
+    if (!["schemaVersion", "outcome", "examples"].includes(key)) return undefined;
+  if (document.schemaVersion !== "continuity-verifier-result/v1") return undefined;
+  const outcome = document.outcome;
+  if (outcome !== "passed" && outcome !== "refuted" && outcome !== "errored") return undefined;
+  const examples = document.examples;
+  if (!examples || typeof examples !== "object" || Array.isArray(examples)) return undefined;
+  const counts = examples as Record<string, unknown>;
+  for (const key of Object.keys(counts))
+    if (!["total", "refuted", "errored", "skipped"].includes(key)) return undefined;
+  const total = boundedCount(counts.total);
+  const refuted = boundedCount(counts.refuted);
+  const errored = boundedCount(counts.errored);
+  const skipped = counts.skipped === undefined ? 0 : boundedCount(counts.skipped);
+  if (
+    total === undefined ||
+    refuted === undefined ||
+    errored === undefined ||
+    skipped === undefined ||
+    skipped > total ||
+    refuted > total
+  )
+    return undefined;
+  return { outcome, counts: { executed: total - skipped, refuted, errored } };
+}
+
+async function readResultDocument(
+  path: string,
+  protocol: "native" | "junit",
+): Promise<DocumentReading> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch {
+    return { kind: "absent" };
+  }
+  // A verifier that replaced the document with a link is not writing a verdict.
+  if (!info.isFile()) return { kind: "unreadable" };
+  if (info.size === 0) return { kind: "absent" };
+  if (info.size > resultDocumentLimit) return { kind: "too_large" };
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(path);
+  } catch {
+    return { kind: "unreadable" };
+  }
+  if (bytes.byteLength === 0) return { kind: "absent" };
+  if (bytes.byteLength > resultDocumentLimit) return { kind: "too_large" };
+  const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  const parsed =
+    protocol === "native"
+      ? nativeCounts(bytes.toString("utf8"))
+      : junitCounts(bytes.toString("utf8"));
+  if (!parsed) return { kind: "unparseable", digest };
+  return { kind: "verdict", digest, outcome: parsed.outcome, counts: parsed.counts };
+}
+
+/**
+ * Turn a finished process plus its verdict document into exactly one closed
+ * outcome. This is the whole of the discrimination claim: a crash is never a
+ * pass and is never a refutation, and no path through here can report `refuted`
+ * without a document that said so.
+ */
+function classifyReading(
+  reading: DocumentReading,
+  exitCode: number | null,
+): { outcome: RunOutcome; reason: OutcomeReason | null; counts?: ExampleCounts } {
+  if (reading.kind === "absent")
+    // A declared protocol that wrote nothing and exited non-zero crashed before
+    // it could report; the same silence with a clean exit is a missing document.
+    return { outcome: "errored", reason: exitCode !== 0 ? "nonzero_exit" : "result_missing" };
+  if (reading.kind === "too_large") return { outcome: "errored", reason: "result_too_large" };
+  if (reading.kind === "unreadable" || reading.kind === "unparseable")
+    return { outcome: "errored", reason: "result_unparseable" };
+  if (reading.outcome === "errored" || reading.counts.errored > 0)
+    return { outcome: "errored", reason: "verifier_reported_error", counts: reading.counts };
+  // Only the direction that could hide a failure is checked. A refutation
+  // reported by a document whose process exited 0 stays a refutation: plenty of
+  // real pipelines swallow the exit status, and understating health is safe
+  // where overstating it is not.
+  if (reading.outcome === "passed" && exitCode !== 0)
+    return { outcome: "errored", reason: "result_disagrees_exit", counts: reading.counts };
+  if (reading.counts.executed === 0)
+    return { outcome: "errored", reason: "no_examples_ran", counts: reading.counts };
+  if (reading.outcome === "refuted")
+    return { outcome: "refuted", reason: null, counts: reading.counts };
+  return { outcome: "pass", reason: null, counts: reading.counts };
+}
+
+function closedSignal(signal: NodeJS.Signals | null): ResultSignal | null {
+  if (!signal) return null;
+  return RESULT_SIGNALS.includes(signal as ResultSignal) ? (signal as ResultSignal) : "other";
+}
+
+/**
+ * Where the native verdict document lives: a runner-chosen file outside the
+ * repository. It is deliberately not a declared package path, because every
+ * regular file under `.continuity/promises/<id>/` must be digest-locked, and a
+ * document written there during the good control would make every later control
+ * custody-invalid.
+ */
+function nativeResultPath(): string {
+  const temporary = process.env.RUNNER_TEMP;
+  const base = temporary && isAbsolute(temporary) ? temporary : tmpdir();
+  return pathResolve(base, `balladeer-verifier-result-${randomUUID()}.json`);
 }
 
 export async function runVerifier(
@@ -1339,6 +1779,8 @@ export async function runVerifier(
   const pkg = validatePackage(pkgInput);
   if (!isGitSha(sourceSha)) throw new Error("sourceSha must be an exact 40-hex commit SHA");
   const spec = pkg.verifier[control];
+  const protocol = pkg.results?.protocol;
+  const resultProtocol: ResultProtocol = protocol ?? "exit-code-only";
   const started = new Date();
   const custodyInvalid = (): RunResult =>
     closedResult(
@@ -1348,8 +1790,10 @@ export async function runVerifier(
       started,
       sourceSha,
       "custody-invalid",
+      "custody_failed",
       null,
       "invalid",
+      resultProtocol,
     );
   if (!(await verifyLockedMaterials(pkg, executionRoot))) return custodyInvalid();
   const timeout = spec.timeoutMs ?? 120_000;
@@ -1365,6 +1809,33 @@ export async function runVerifier(
   if (relativeCwd.startsWith("..") || isAbsolute(relativeCwd)) {
     return custodyInvalid();
   }
+
+  // Resolve the verdict document's path before the process starts, under the
+  // same closure and symlink rules the locked materials get. A JUnit report is
+  // named by the package relative to the command's own working directory, which
+  // is the base the test runner writes to; a native document is the runner's
+  // own temporary file.
+  let resultPath: string | undefined;
+  if (protocol === "native") resultPath = nativeResultPath();
+  else if (protocol === "junit") {
+    const declared = pkg.results!.file!;
+    const target = pathResolve(cwd, declared);
+    let parent: string;
+    try {
+      parent = await realpath(dirname(target));
+    } catch {
+      return custodyInvalid();
+    }
+    const relativeParent = relative(root, parent);
+    if (relativeParent.startsWith("..") || isAbsolute(relativeParent)) return custodyInvalid();
+    resultPath = pathResolve(parent, basename(target));
+    const existing = await lstat(resultPath).catch(() => undefined);
+    if (existing && (existing.isSymbolicLink() || !existing.isFile())) return custodyInvalid();
+  }
+  // A document left behind by an earlier run is a replay vector: after this,
+  // absence once the process has exited means the verifier never wrote one.
+  if (resultPath) await unlink(resultPath).catch(() => undefined);
+
   return new Promise((settle) => {
     const echo = outputEcho(pkg.promise.id, control);
     let stdoutBytes = 0;
@@ -1374,13 +1845,14 @@ export async function runVerifier(
     let settled = false;
     let exited = false;
     let forcedOutcome: RunOutcome | undefined;
+    let forcedReason: OutcomeReason | undefined;
     const child = spawn(spec.executable, spec.args, {
       cwd,
       shell: false,
       detached: true,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
-      env: verifierEnvironment(),
+      env: verifierEnvironment(process.env, resultPath),
     });
     const terminateGroup = (signal: NodeJS.Signals) => {
       if (child.pid) {
@@ -1396,8 +1868,13 @@ export async function runVerifier(
       }
     };
     let killTimer: NodeJS.Timeout | undefined;
-    const stop = (outcome: RunOutcome) => {
-      forcedOutcome ??= outcome;
+    // A runner-initiated stop carries both the outcome and the reason, so the
+    // process group's own SIGTERM can never be mistaken for a CI cancellation.
+    const stop = (outcome: RunOutcome, reason: OutcomeReason) => {
+      if (forcedOutcome === undefined) {
+        forcedOutcome = outcome;
+        forcedReason = reason;
+      }
       terminateGroup("SIGTERM");
       killTimer ??= setTimeout(() => terminateGroup("SIGKILL"), 250);
     };
@@ -1405,11 +1882,11 @@ export async function runVerifier(
       if (stream === "stdout") {
         stdoutBytes += chunk.byteLength;
         stdoutHash.update(chunk);
-        if (stdoutBytes > outputLimit) stop("unknown");
+        if (stdoutBytes > outputLimit) stop("errored", "output_limit");
       } else {
         stderrBytes += chunk.byteLength;
         stderrHash.update(chunk);
-        if (stderrBytes > outputLimit) stop("unknown");
+        if (stderrBytes > outputLimit) stop("errored", "output_limit");
       }
       // The digest above covers every raw byte. The echo below is a bounded,
       // sanitized copy for the customer's own job log and changes nothing that
@@ -1418,26 +1895,84 @@ export async function runVerifier(
     };
     child.stdout.on("data", (chunk: Buffer) => updateOutput(chunk, "stdout"));
     child.stderr.on("data", (chunk: Buffer) => updateOutput(chunk, "stderr"));
-    const timer = setTimeout(() => stop("unknown"), timeout);
-    const finish = (outcome: RunOutcome, exitCode: number | null) => {
+    const timer = setTimeout(() => stop("timed_out", "timeout"), timeout);
+    let exitCodeSeen: number | null = null;
+    let signalSeen: NodeJS.Signals | null = null;
+    let spawnFailed = false;
+    let closed = false;
+    let graceTimer: NodeJS.Timeout | undefined;
+
+    /**
+     * Exactly one closed outcome, derived in this order: custody, spawn
+     * failure, runner-initiated timeout, output limit, external cancellation,
+     * any other signal, then the verdict document. Nothing below the signal
+     * rows can reach `pass` or `refuted` without a document that said so.
+     */
+    const finish = async (): Promise<void> => {
       if (settled || !exited) return;
       settled = true;
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      if (graceTimer) clearTimeout(graceTimer);
       echo.flush();
+
+      let outcome: RunOutcome;
+      let reason: OutcomeReason | null;
+      let exitCode: number | null = exitCodeSeen;
+      let counts: ExampleCounts | undefined;
+      let documentDigest: string | null = null;
+
+      if (spawnFailed) {
+        outcome = "errored";
+        reason = "spawn_failed";
+        exitCode = null;
+      } else if (forcedOutcome !== undefined) {
+        outcome = forcedOutcome;
+        reason = forcedReason ?? "timeout";
+        exitCode = null;
+      } else if (signalSeen === "SIGTERM" || signalSeen === "SIGINT") {
+        // Nothing in this runner sent it, so someone outside did: a cancelled
+        // CI run, not a verdict about the behavior.
+        outcome = "canceled";
+        reason = "canceled_external";
+      } else if (signalSeen) {
+        // A segmentation fault or an abort is a crash. Calling it `canceled`
+        // would spend an evidence-lifecycle word on a broken verifier.
+        outcome = "errored";
+        reason = "signal_killed";
+      } else if (protocol === undefined) {
+        outcome = exitCode === 0 ? "pass" : "errored";
+        reason = exitCode === 0 ? null : "protocol_undeclared";
+      } else {
+        const reading = await readResultDocument(resultPath!, protocol);
+        if (reading.kind === "unparseable" || reading.kind === "verdict")
+          documentDigest = reading.digest;
+        const classified = classifyReading(reading, exitCode);
+        outcome = classified.outcome;
+        reason = classified.reason;
+        counts = classified.counts;
+      }
+      if (resultPath) await unlink(resultPath).catch(() => undefined);
+
       const completed = new Date();
       const base: Omit<RunResult, "resultDigest"> = {
-        schemaVersion: RUNNER_SCHEMA,
+        schemaVersion: RESULT_SCHEMA,
         runnerVersion: RUNNER_VERSION,
         promiseId: pkg.promise.id,
         packageDigest: pkg.packageDigest,
         sourceSha,
         control,
         outcome,
+        outcomeReason: reason,
         exitCode,
+        signal: closedSignal(signalSeen),
         durationMs: Math.max(0, completed.getTime() - started.getTime()),
         stdoutDigest: `sha256:${stdoutHash.digest("hex")}`,
         stderrDigest: `sha256:${stderrHash.digest("hex")}`,
+        resultProtocol,
+        resultDocumentDigest: documentDigest,
+        exampleTotal: counts?.executed ?? null,
+        exampleRefuted: counts?.refuted ?? null,
         startedAt: started.toISOString(),
         completedAt: completed.toISOString(),
         custody: "local",
@@ -1445,22 +1980,24 @@ export async function runVerifier(
       settle({ ...base, resultDigest: resultDigest(base) });
     };
     child.once("error", () => {
-      forcedOutcome ??= "unknown";
+      spawnFailed = true;
       exited = true;
-      finish("unknown", null);
+      void finish();
+    });
+    child.once("close", () => {
+      closed = true;
+      if (exited) void finish();
     });
     child.once("exit", (code, signal) => {
+      exitCodeSeen = code;
+      signalSeen = signal;
       exited = true;
-      const outcome =
-        forcedOutcome ??
-        (signal
-          ? signal === "SIGTERM"
-            ? "unknown"
-            : "canceled"
-          : expectedFor(control, code)
-            ? "pass"
-            : "fail");
-      finish(outcome, code);
+      // Settle once the pipes are closed, so a document written by a
+      // grandchild is fully flushed before it is read and digested. A
+      // grandchild that holds the pipes open forever must not hold the run
+      // open with it, so the wait is bounded.
+      if (closed) void finish();
+      else graceTimer = setTimeout(() => void finish(), 250);
     });
   });
 }
@@ -1478,22 +2015,30 @@ function closedResult(
   started: Date,
   sourceSha: string,
   outcome: RunOutcome,
+  outcomeReason: OutcomeReason | null,
   exitCode: number | null,
   custody: RunResult["custody"],
+  resultProtocol: ResultProtocol,
 ): RunResult {
   const completed = new Date();
   const base: Omit<RunResult, "resultDigest"> = {
-    schemaVersion: RUNNER_SCHEMA,
+    schemaVersion: RESULT_SCHEMA,
     runnerVersion: RUNNER_VERSION,
     promiseId,
     packageDigest,
     sourceSha,
     control,
     outcome,
+    outcomeReason,
     exitCode,
+    signal: null,
     durationMs: Math.max(0, completed.getTime() - started.getTime()),
     stdoutDigest: sha256(""),
     stderrDigest: sha256(""),
+    resultProtocol,
+    resultDocumentDigest: null,
+    exampleTotal: null,
+    exampleRefuted: null,
     startedAt: started.toISOString(),
     completedAt: completed.toISOString(),
     custody,
@@ -1598,7 +2143,20 @@ export async function runTamperControls(
   for (const pkg of packages) controls.push(await runTamperControl(pkg, executionRoot, sourceSha));
   return controls;
 }
-export function exercisePasses(results: RunResult[]): boolean {
+/** What each control must report for the verifier to have discriminated. */
+const discriminatingOutcome: Record<Control, RunOutcome> = {
+  good: "pass",
+  bad: "refuted",
+  refactor: "pass",
+};
+
+/**
+ * A verifier discriminates when the good and refactor controls report `pass`
+ * and the known-bad control reports `refuted`. A crashed known-bad control used
+ * to satisfy this, because "not a pass" was all that was asked of it; now only
+ * a verifier that actually refused the behavior does.
+ */
+export function exerciseDiscriminates(results: RunResult[]): boolean {
   const promiseIds = new Set(results.map((result) => result.promiseId));
   return (
     promiseIds.size > 0 &&
@@ -1611,7 +2169,7 @@ export function exercisePasses(results: RunResult[]): boolean {
             (result) =>
               result.promiseId === promiseId &&
               result.control === control &&
-              result.outcome === "pass",
+              result.outcome === discriminatingOutcome[control],
           ),
       ),
     )
@@ -1651,14 +2209,17 @@ export function qualificationSummary(
 ): {
   sourceSha: string;
   sourceShaConsistent: boolean;
-  allControlsPassed: boolean;
+  allControlsDiscriminated: boolean;
+  undecidedControls: number;
   packageTamperDetected: boolean;
   verifierTamperDetected: boolean;
   tamperDetected: boolean;
   custody: "customer-local-unattested";
   perPromise: {
     promiseId: string;
-    controlsPassed: boolean;
+    controlsDiscriminated: boolean;
+    undecidedControls: number;
+    resultProtocol: ResultProtocol;
     packageTamperDetected: boolean;
     verifierTamperDetected: boolean;
     verifierDigest: string;
@@ -1666,6 +2227,16 @@ export function qualificationSummary(
     materialsDigest: string;
   }[];
 } {
+  // A control that could not decide is counted separately from one that
+  // decided the wrong way. Both leave the package unqualified, and only the
+  // second says anything about the verifier's behavior.
+  const undecided = (items: RunResult[]): number =>
+    items.filter(
+      (result) =>
+        result.outcome === "errored" ||
+        result.outcome === "timed_out" ||
+        result.outcome === "canceled",
+    ).length;
   const perPromise = packages.map((pkg) => {
     const ownResults = results.filter((result) => result.promiseId === pkg.promise.id);
     const tamper = tamperControls.find((item) => item.promiseId === pkg.promise.id);
@@ -1675,7 +2246,9 @@ export function qualificationSummary(
     const tamperDetected = tamper?.outcome === "detected";
     return {
       promiseId: pkg.promise.id,
-      controlsPassed: exercisePasses(ownResults),
+      controlsDiscriminated: exerciseDiscriminates(ownResults),
+      undecidedControls: undecided(ownResults),
+      resultProtocol: pkg.results?.protocol ?? ("exit-code-only" as const),
       packageTamperDetected: tamperDetected,
       verifierTamperDetected: tamperDetected,
       tamperDetected,
@@ -1690,7 +2263,9 @@ export function qualificationSummary(
   return {
     sourceSha,
     sourceShaConsistent,
-    allControlsPassed: sourceShaConsistent && perPromise.every((item) => item.controlsPassed),
+    allControlsDiscriminated:
+      sourceShaConsistent && perPromise.every((item) => item.controlsDiscriminated),
+    undecidedControls: undecided(results),
     packageTamperDetected: perPromise.every((item) => item.packageTamperDetected),
     verifierTamperDetected: perPromise.every((item) => item.verifierTamperDetected),
     tamperDetected: perPromise.every((item) => item.tamperDetected),
@@ -1702,6 +2277,8 @@ export function createOffboardingExport(pkgInput: AcceptancePackage, results: Ru
   const pkg = validatePackage(pkgInput);
   results.forEach(validateResult);
   return {
+    // The export carries a sealed package, so it keeps the package schema. The
+    // results inside it carry their own result schema.
     schemaVersion: RUNNER_SCHEMA,
     exportedAt: new Date().toISOString(),
     package: pkg,

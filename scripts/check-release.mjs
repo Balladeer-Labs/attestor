@@ -116,6 +116,11 @@ const verifyJob = jobBody("verify");
 const publishJob = jobBody("publish");
 const qualifyControlsJob = jobBody("qualify-controls");
 const qualifyPublishJob = jobBody("qualify-publish");
+const qualifyGateJob = jobBody("qualify-gate");
+// Library names the runner must never reach for. The verdict document is read
+// by attribute extraction over a bounded byte count, not by a parser, so the
+// "runner imports only node: modules" property holds without an exception.
+const xmlLibraries = ["xml2js", "fast-xml-parser", "xmldom", "libxmljs", "sax-js", "cheerio"];
 const curlLines = workflow.split("\n").filter((line) => /\bcurl\s/.test(line));
 
 const assertions = [
@@ -179,11 +184,11 @@ const assertions = [
     "source-reading jobs pin Node 22.18.0",
   ],
   [
-    (workflow.match(/runs-on: ubuntu-24\.04/g) ?? []).length === 5 &&
+    (workflow.match(/runs-on: ubuntu-24\.04/g) ?? []).length === 6 &&
       !workflow.includes("ubuntu-latest"),
     "attestor jobs pin Ubuntu 24.04",
   ],
-  [(workflow.match(/timeout-minutes:/g) ?? []).length === 5, "every attestor job has a timeout"],
+  [(workflow.match(/timeout-minutes:/g) ?? []).length === 6, "every attestor job has a timeout"],
   [
     curlLines.length > 0 &&
       curlLines.every(
@@ -214,6 +219,12 @@ const assertions = [
     "all actions pinned",
   ],
   [!runner.match(/^import\s+(?!type\s+).*from\s+["'](?!node:)/gm), "runner imports only Node modules"],
+  [
+    !runner.includes("require(") &&
+      !runnerCli.includes("require(") &&
+      xmlLibraries.every((library) => !runner.includes(library)),
+    "the verdict document is read without a parser library",
+  ],
   [!runner.includes("fetch("), "runner has no network client"],
   [
     !runner.includes("Promise.all(") && !runnerCli.includes("Promise.all("),
@@ -246,6 +257,41 @@ const assertions = [
     security.includes("customer's own GitHub job log") &&
       trustBoundary.includes("customer's own GitHub job log"),
     "verifier output is documented as customer-local",
+  ],
+  // A crash and a refusal must be different results. These assertions pin the
+  // three places that could quietly put them back together: a shared schema
+  // constant that would invalidate sealed packages, a control-mode inversion
+  // that reads "not a pass" as a refutation, and a qualification receipt that
+  // treats an undecided control as evidence.
+  [
+    runner.includes('export const RUNNER_SCHEMA = "continuity-package/v1"') &&
+      runner.includes('export const RESULT_SCHEMA = "continuity-result/v2"'),
+    "the sealed package and the published result are versioned separately",
+  ],
+  [
+    !runner.includes("expectedFor") &&
+      runner.includes("export const OUTCOME_REASONS") &&
+      runner.includes("export function exerciseDiscriminates") &&
+      !runner.includes("exercisePasses"),
+    "a control reports what its verifier said, not what its mode expected",
+  ],
+  [
+    runner.includes("BALLADEER_RESULT_PATH") &&
+      runner.includes("function classifyReading(") &&
+      runner.includes("nativeResultPath"),
+    "the verdict comes from a declared result document",
+  ],
+  [
+    workflow.includes("This is a caught regression.") &&
+      workflow.includes("This is not a regression; the check could not run."),
+    "the customer check names which kind of not-a-pass it found",
+  ],
+  [
+    qualifyGateJob.includes("needs: [qualify-controls, qualify-publish]") &&
+      !qualifyGateJob.includes("id-token: write") &&
+      !qualifyGateJob.includes("actions/checkout@") &&
+      qualifyControlsJob.includes("has_receipts"),
+    "an undecided qualification control fails the job after its receipt is published",
   ],
   [packageJson.private === false, "release package is public"],
   [packageJson.license === "Apache-2.0", "Apache-2.0 package license"],

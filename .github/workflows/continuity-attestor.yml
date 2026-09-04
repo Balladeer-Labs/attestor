@@ -154,9 +154,22 @@ jobs:
       - name: Report target regressions as an advisory check
         run: |
           set -euo pipefail
+          # The check is still red for anything but a pass, and it now says which
+          # kind of not-a-pass it is. Only a refutation is a caught regression; a
+          # verifier that could not decide must never be read as one.
+          if jq -e 'any(.results[]; .outcome == "refuted")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer: a protected behavior was refuted by its verifier. This is a caught regression."
+            jq -r '.results[] | select(.outcome == "refuted") | "\(.promiseId): refuted"' "$RESULT_PATH"
+          fi
+          if jq -e 'any(.results[]; .outcome == "errored" or .outcome == "timed_out")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer: a verifier could not produce a verdict. This is not a regression; the check could not run."
+            jq -r '.results[] | select(.outcome == "errored" or .outcome == "timed_out") | "\(.promiseId): \(.outcome) (\(.outcomeReason // "unspecified"))"' "$RESULT_PATH"
+          fi
+          if jq -e 'any(.results[]; .outcome == "canceled" or .outcome == "custody-invalid")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer advisory check: at least one active promise is inconclusive."
+            jq -r '.results[] | select(.outcome == "canceled" or .outcome == "custody-invalid") | "\(.promiseId): \(.outcome)"' "$RESULT_PATH"
+          fi
           if jq -e 'any(.results[]; .outcome != "pass")' "$RESULT_PATH" >/dev/null; then
-            echo "Balladeer advisory check: at least one active promise failed or is inconclusive."
-            jq -r '.results[] | "\(.promiseId): \(.outcome)"' "$RESULT_PATH"
             exit 1
           fi
           if jq -e '(.results | length) == 0' "$RESULT_PATH" >/dev/null; then
@@ -295,3 +308,38 @@ jobs:
             curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/qualification-receipts" \
               -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @"$receipt"
           done
+
+  # The gate runs after publication, never instead of it. A control that could
+  # not decide still owes the control plane its receipt: that is what records
+  # the promise as unqualified with the reason. Failing the job before the
+  # receipt is sent would leave the binding silently unqualified and the job
+  # green, which is the third way a crash used to pass for evidence.
+  qualify-gate:
+    if: ${{ always() && needs.qualify-controls.result == 'success' && needs.qualify-controls.outputs.has_receipts == 'true' }}
+    needs: [qualify-controls, qualify-publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No checkout and no OIDC: this job reads closed receipts only.
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: continuity-qualification-receipts
+          path: qualification-requests
+      - name: Refuse a control that could not decide
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          receipts=(qualification-requests/*.json)
+          test "${#receipts[@]}" -gt 0
+          undecided=0
+          for receipt in "${receipts[@]}"; do
+            if jq -e 'any(.controls | to_entries[]; .value.outcome == "errored" or .value.outcome == "timed_out" or .value.outcome == "canceled")' "$receipt" >/dev/null; then
+              undecided=1
+              jq -r '.controls | to_entries[] | select(.value.outcome == "errored" or .value.outcome == "timed_out" or .value.outcome == "canceled") | "\(.key) control: \(.value.outcome) (\(.value.outcomeReason // "unspecified"))"' "$receipt"
+            fi
+          done
+          if [[ "$undecided" != 0 ]]; then
+            echo "Balladeer: a qualification control could not produce a verdict, so this promise cannot be qualified. A crashed control says nothing about whether the verifier can tell a broken behavior from a working one."
+            exit 1
+          fi

@@ -122,9 +122,15 @@ try {
                 package: item,
             }));
             await announceRun(selections, results);
+            // A control that could not decide never qualifies a binding. It is named
+            // separately from a control that decided the wrong way, because a crashed
+            // known-bad control says nothing at all about whether the verifier can
+            // tell a broken behavior from a working one.
+            if (qualificationMode && qualification && qualification.undecidedControls > 0)
+                throw new Error("qualification requires every control to produce a verdict; at least one control errored, timed out, or was canceled, so this package cannot be qualified");
             if ((command === "baseline" || command === "qualify") &&
-                (!qualification || !qualification.allControlsPassed || !qualification.tamperDetected))
-                throw new Error("baseline requires passing good, bad, refactor, and actual material-tamper controls");
+                (!qualification || !qualification.allControlsDiscriminated || !qualification.tamperDetected))
+                throw new Error("qualification requires the good control to pass, the known-bad control to be refuted, the refactor control to pass, and an actual material-tamper control to be detected");
             console.log(JSON.stringify(output));
         }
         else if (command === "offboarding") {
