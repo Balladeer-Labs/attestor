@@ -537,7 +537,11 @@ export function validatePackage(input: unknown): AcceptancePackage {
   keysAre(input, packageKeys, "package", ["results"]);
   if (input.schemaVersion !== RUNNER_SCHEMA)
     throw new Error(`package.schemaVersion must be ${RUNNER_SCHEMA}`);
-  keysAre(input.promise, meaningKeys, "promise");
+  // `refactorExamples` is optional in the approved meaning: nothing asks a
+  // person for one any more, and a meaning recorded while it was required
+  // still carries it. This widens what a package may omit and narrows nothing.
+  // The refactor CONTROL below is a separate field and is unchanged.
+  keysAre(input.promise, meaningKeys, "promise", ["refactorExamples"]);
   const promiseId = stringField(input.promise.id, "promise.id");
   for (const key of ["title", "beneficiary", "trigger", "observableOutcome", "ownerId"])
     stringField(input.promise[key], `promise.${key}`);
@@ -546,8 +550,10 @@ export function validatePackage(input: unknown): AcceptancePackage {
   digestField(input.promise.semanticDigest, "promise.semanticDigest");
   for (const key of ["preconditions", "allowedVariations", "nonGoals"])
     stringArray(input.promise[key], `promise.${key}`);
-  for (const key of ["passingExamples", "failingExamples", "refactorExamples"])
+  for (const key of ["passingExamples", "failingExamples"])
     validateExamples(input.promise[key], `promise.${key}`);
+  if (input.promise.refactorExamples !== undefined)
+    validateExamples(input.promise.refactorExamples, "promise.refactorExamples");
   keysAre(input.promise.scope, ["repositoryId", "surfaces", "labels"], "promise.scope");
   stringField(input.promise.scope.repositoryId, "promise.scope.repositoryId");
   const surfaces = stringArray(input.promise.scope.surfaces, "promise.scope.surfaces");
