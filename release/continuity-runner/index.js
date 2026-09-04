@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFile, lstat, mkdir, readdir, readFile, realpath, stat, unlink, writeFile, } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, relative, resolve as pathResolve, } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve as pathResolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 // The sealed package and the published result are versioned separately on
 // purpose. A package sealed before the verifier result protocol existed is
@@ -47,6 +47,21 @@ export const OUTCOME_REASONS = [
 /**
  * Signal names are OS-supplied strings, so they are mapped onto a closed list
  * before they can reach a published field. Anything else is `other`.
+ *
+ * The list names every signal a person would want to tell apart when reading
+ * why a verifier died, and the resource-limit signals earn their place: a
+ * container that hits its CPU budget is killed with `SIGXCPU`, one that hits a
+ * file-size limit with `SIGXFSZ`, and a debugger trap or a failed assertion
+ * compiled into a native dependency arrives as `SIGTRAP`. Collapsed into
+ * `other` those three are indistinguishable from an unknown signal, and the
+ * repair for each is different: raise the budget, raise the limit, fix the
+ * dependency. All three are `errored` / `signal_killed` either way, so naming
+ * them changes only what the reason line can say, never the verdict.
+ *
+ * This is the same closed list the control plane's intake accepts, which is a
+ * superset by construction: the intake keeps every name this list carries, so a
+ * result from an older runner that only ever reported the shorter list still
+ * parses unchanged.
  */
 export const RESULT_SIGNALS = [
     "SIGABRT",
@@ -60,6 +75,9 @@ export const RESULT_SIGNALS = [
     "SIGQUIT",
     "SIGSEGV",
     "SIGTERM",
+    "SIGTRAP",
+    "SIGXCPU",
+    "SIGXFSZ",
     "other",
 ];
 /** The largest example count a published result may carry. */
@@ -707,6 +725,14 @@ export async function buildQualificationRequest(pkgInput, metadataInput, executi
     };
     return {
         schemaVersion: "continuity-qualification/v1",
+        // How this package's verifiers reported their verdicts travels with the
+        // receipt. Without it every stored receipt looks pre-protocol, and the
+        // control plane cannot say which bindings were qualified by a runner that
+        // could tell a crash from a refusal and which rest on a bare exit status.
+        // An exit-code-only package can never publish `refuted`, so it can never
+        // qualify; saying so on the receipt is what makes that visible rather than
+        // merely true.
+        resultProtocol: pkg.results?.protocol ?? "exit-code-only",
         receiptId: metadata.receiptId,
         workspaceLocator: metadata.workspaceLocator,
         repository: metadata.repository,
@@ -1127,6 +1153,19 @@ function unavailableExplanation(reason) {
     return "More than one sealed package declares this promise id, so no verifier ran. Remove the duplicate.";
 }
 const summaryLimit = 65_536;
+/**
+ * Two outcomes are annotated as GitHub errors, and they are errors for
+ * different reasons. `refuted` is the only caught regression: a verifier ran to
+ * completion and reported that the behavior no longer holds. `custody-invalid`
+ * is not a regression and never blames the customer's code, but it is not "the
+ * check could not run" either: digest-locked material changed, so no result
+ * from this run can be trusted, and that is a red an owner has to act on rather
+ * than a condition that may clear itself on the next push.
+ *
+ * Everything else that is not a pass is a warning. A crash, a timeout, or an
+ * external cancellation leaves the behavior unmeasured, and painting it the
+ * same red as a refutation is exactly the conflation this protocol removes.
+ */
 function annotationLevel(outcome) {
     if (outcome === "pass")
         return "notice";
@@ -1189,9 +1228,11 @@ export async function announceRun(selections, results, rejectedPackageFiles = []
         const named = `${result.outcome}${result.outcomeReason === null ? "" : ` (${result.outcomeReason})`}`;
         const sentence = `${subject}: ${result.control} control outcome ${named}.${detail === "" ? "" : ` ${detail}`}`;
         humanLine(sentence);
-        // Only a refutation is a caught regression. A crash, a timeout, or a
-        // cancellation is a warning: it never blames the customer's code for
-        // breaking a behavior nobody managed to check.
+        // Only a refutation is a caught regression, and a custody failure is the
+        // one other outcome that earns a red: the material changed, so nothing this
+        // run produced can be trusted. A crash, a timeout, or a cancellation is a
+        // warning, because it never blames the customer's code for breaking a
+        // behavior nobody managed to check.
         annotate(annotationLevel(result.outcome), sentence);
         rows.push(`| ${cell(subject, 240)} | ${result.control} | ${named} | ${cell(detail, 240)} |`);
     }
@@ -1208,7 +1249,12 @@ export async function announceRun(selections, results, rejectedPackageFiles = []
  * verifier writes its verdict document to. It is not a passthrough: the runner
  * chooses the value.
  */
-export function verifierEnvironment(environment = process.env, resultPath) {
+export function verifierEnvironment(
+// Any environment map, not the process's own type. This reads an allow-list
+// of names and nothing else, and a caller handing it a constructed
+// environment, to prove that a control-plane variable really is dropped, is
+// exactly the case worth testing.
+environment = process.env, resultPath) {
     const allowed = [
         "PATH",
         "HOME",
@@ -1265,9 +1311,11 @@ function countAttribute(element, name) {
 function junitCounts(text) {
     const totals = { tests: 0, failures: 0, errors: 0, skipped: 0 };
     const root = /<testsuites\b[^>]*>/.exec(text.slice(0, junitRootScanLimit));
-    const suites = root && countAttribute(root[0], "tests") !== undefined
-        ? [root[0]]
-        : text.match(/<testsuite\b[^>]*>/g) ?? [];
+    const children = text.match(/<testsuite\b[^>]*>/g) ?? [];
+    // The root carries the totals when it states them, and the child suites are
+    // summed when it does not.
+    const rootTotals = root !== null && countAttribute(root[0], "tests") !== undefined ? root[0] : undefined;
+    const suites = rootTotals === undefined ? children : [rootTotals];
     if (suites.length === 0 || suites.length > junitSuiteLimit)
         return undefined;
     for (const suite of suites) {
@@ -1283,6 +1331,24 @@ function junitCounts(text) {
         totals.failures += failures;
         totals.errors += errors;
         totals.skipped += skipped;
+    }
+    // A skip is the one count a `<testsuites>` root is routinely allowed to omit.
+    // jest-junit writes a root of exactly `name tests failures errors time` and
+    // records `skipped` only on each child suite, so a report whose every example
+    // was skipped reads, from the root alone, as forty tests that passed. That is
+    // the same class of defect as a crash reading as a pass, on the run an owner
+    // trusts most, so when the root does not say how many were skipped the
+    // children are asked. A count that cannot be reconciled with the root's own
+    // total is not a report this runner will take a verdict from.
+    if (rootTotals !== undefined && countAttribute(rootTotals, "skipped") === undefined) {
+        if (children.length > junitSuiteLimit)
+            return undefined;
+        let childSkipped = 0;
+        for (const suite of children)
+            childSkipped += countAttribute(suite, "skipped") ?? 0;
+        if (childSkipped > totals.tests)
+            return undefined;
+        totals.skipped = childSkipped;
     }
     if (Object.values(totals).some((value) => boundedCount(value) === undefined))
         return undefined;
@@ -1488,6 +1554,9 @@ export async function runVerifier(pkgInput, control, executionRoot = process.cwd
             detached: true,
             windowsHide: true,
             stdio: ["ignore", "pipe", "pipe"],
+            // Deliberately not the ambient environment: this is the closed allow-list
+            // the child gets instead of it, so it is stated as such rather than
+            // inheriting the shape of `process.env`.
             env: verifierEnvironment(process.env, resultPath),
         });
         const terminateGroup = (signal) => {

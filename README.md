@@ -113,8 +113,12 @@ variable inside an argument: write the same literal path in `results.file` and i
 command's arguments, relative to the command's working directory, and the package refuses
 to seal if they disagree. The path must be outside `.continuity/promises/`, since a report
 written inside that tree would break exact material closure for the next control. The
-runner reads three integers from it (`tests`, `failures`, `errors`, and `skipped` when
-present) and nothing else: no test name, no failure message, no element text.
+runner reads four integers from it (`tests`, `failures`, `errors`, and `skipped`) and
+nothing else: no test name, no failure message, no element text. Totals come from the
+`<testsuites>` root when it carries them, and from the child `<testsuite>` elements
+otherwise. `skipped` is the one count a root routinely omits (jest-junit writes it only on
+the children), so when the root does not carry it the children are summed: a suite that
+skipped every example reports `errored` / `no_examples_ran`, never a pass over nothing.
 
 A package with no `results` member is exit-code-only. It reports `pass` on exit 0 and
 `errored` on anything else, and it can never report `refuted`, so it can never qualify.
@@ -131,9 +135,15 @@ Every result carries exactly one outcome: `pass` (the verifier ran and the behav
 possible: a crash, a spawn failure, a missing or malformed document, or a suite that ran no
 examples), `timed_out`, `canceled` (an external SIGTERM or SIGINT, such as a cancelled CI
 run), or `custody-invalid`. Everything but `pass` and `refuted` also carries a closed
-`outcomeReason` naming which case it was. Only `refuted` is a caught regression: it is the
-only outcome annotated as a GitHub error, and the check prints "this is not a regression;
-the check could not run" for the rest. The check is red either way.
+`outcomeReason` naming which case it was. Only `refuted` is a caught regression, and the
+check prints "this is not a regression; the check could not run" for `errored` and
+`timed_out`. The check is red either way.
+
+Two outcomes are annotated as GitHub errors, for different reasons. `refuted` is the caught
+regression. `custody-invalid` is not a regression and never blames your code, but it is not
+"the check could not run" either: digest-locked material changed, so no result from that run
+can be trusted. `errored`, `timed_out` and `canceled` are annotated as warnings, so a
+verifier that crashed never looks in the GitHub UI like a behavior that broke.
 
 The runner writes each verifier's own stdout and stderr into the GitHub job log, one line
 at a time behind a `[balladeer]` prefix, followed by a sentence per promise naming the
@@ -150,6 +160,15 @@ A published result carries exactly these 21 fields and nothing else: `schemaVers
 `continuity-package/v1` schema and its own digest, so this result version costs no customer
 a re-seal.
 
+`signal` is mapped onto a closed list before it is published, so no operating-system string
+crosses the wire: `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGHUP`, `SIGILL`, `SIGINT`, `SIGKILL`,
+`SIGPIPE`, `SIGQUIT`, `SIGSEGV`, `SIGTERM`, `SIGTRAP`, `SIGXCPU`, `SIGXFSZ`, and `other` for
+everything else. The resource-limit names are worth keeping apart: a container that
+exhausts its CPU budget is killed with `SIGXCPU` and one that hits a file-size limit with
+`SIGXFSZ`, and the repair for each differs from the repair for an unknown signal. All of
+them are `errored` / `signal_killed`, so the name changes only what the reason line can
+say, never the verdict.
+
 Every promise in the frozen manifest produces exactly one result. A promise whose sealed
 package is missing, re-sealed since activation, ambiguous, or unreadable is reported as
 `custody-invalid` on its own, with no verifier run, while every other promise in the same
@@ -159,6 +178,12 @@ catalog.
 A qualification receipt is published even when a control could not decide, so the binding is
 recorded as unqualified with the reason. A separate job then fails the run, after that
 receipt is sent: a crashed control must never leave a green job behind.
+
+The receipt carries `resultProtocol` beside its four controls, naming how that package's
+verdicts were produced (`native`, `junit`, or `exit-code-only`). Each of `good`, `bad` and
+`refactor` publishes exactly `outcome`, `outcomeReason` and `resultDigest`, with
+`outcomeReason` explicitly `null` on a control that reached a verdict; `tamper` publishes
+`outcome` and `resultDigest`. Nothing else about a control leaves your runner.
 
 Never enroll a mutable branch or tag. Tags may make a release easier for people to find,
 but customer callers pin the full 40-character commit SHA.

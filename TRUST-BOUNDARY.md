@@ -11,7 +11,7 @@ fixtures, verifier programs, prompts, or raw verifier output.
 | Enrollment run | A GitHub-signed OIDC token; workspace locator; repository name, numeric repository ID, numeric owner ID; caller ref, workflow name, workflow ref and workflow SHA; event name; run ID and attempt; base, head, and target commit SHAs | A target UUID, one-run challenge, and frozen active manifest containing only target ID, generation time, promise IDs, package digests, and manifest digest | Repository contents and credentials |
 | Verification | Nothing while verifiers execute | Nothing | Source, packages, fixtures, commands, stdout, and stderr, including the verifier output echoed into the customer's own job log |
 | Result publication | A fresh GitHub-signed OIDC token; protocol version and target mode; workspace locator, target UUID, manifest digest, run ID, one-run challenge; one closed result per promise, carrying exactly the 21 fields listed below; and a map of promise IDs to null shadow-applicability observations | HTTP acceptance or a closed validation error | Raw output, the verdict document itself, and the files used to reach the outcome |
-| Qualification on the default branch | A fresh GitHub-signed OIDC token and closed receipt: protocol version; receipt/workspace/revision/binding IDs; repository name and numeric ID; ref, workflow name/ref/SHA; run ID/attempt, event, target/source SHA; semantic, package, verifier, fixture, and workflow digests; recorded time; and good/bad/refactor outcomes with their reason codes and result digests, plus the tamper outcome and its result digest | HTTP acceptance or a closed validation error | Files, commands, and raw outputs behind the digests |
+| Qualification on the default branch | A fresh GitHub-signed OIDC token and closed receipt: protocol version; receipt/workspace/revision/binding IDs; repository name and numeric ID; ref, workflow name/ref/SHA; run ID/attempt, event, target/source SHA; semantic, package, verifier, fixture, and workflow digests; recorded time; the result protocol the package declared (`native`, `junit`, or `exit-code-only`); and good/bad/refactor outcomes with their reason codes and result digests, plus the tamper outcome and its result digest | HTTP acceptance or a closed validation error | Files, commands, and raw outputs behind the digests |
 
 ## The 21 fields of a published result
 
@@ -27,10 +27,13 @@ counts bounded at one million; there is no message, path, test name, or free-tex
 
 A verifier reports its verdict by writing a small document at a runner-chosen path
 (`native`) or by leaving its ordinary JUnit report at a declared path (`junit`). Those
-bytes never leave the customer's runner. The runner reads three integers and one enum out
+bytes never leave the customer's runner. The runner reads four integers and one enum out
 of the document, records the SHA-256 digest of its bytes as `resultDocumentDigest`, and
-deletes the file. No element text, failure message, or test name is ever read, so nothing
-a customer wrote can travel further than a count.
+deletes the file. For a JUnit report the four are `tests`, `failures`, `errors` and
+`skipped`, taken from the `<testsuites>` root where it carries them and from the child
+`<testsuite>` elements otherwise; `skipped` alone is also summed from the children when the
+root omits it, since jest-junit's root does. No element text, failure message, or test name
+is ever read, so nothing a customer wrote can travel further than a count.
 
 The non-secret workspace locator routes a run to the correct Balladeer workspace; it
 does not authorize anything. Authorization comes from GitHub's signed OIDC token and

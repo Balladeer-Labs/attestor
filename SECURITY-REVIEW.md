@@ -77,12 +77,25 @@ For the exact candidate SHA, review or exercise every applicable category:
   document, a document claiming a pass while the process exited non-zero, a suite that
   reported zero tests, and a suite that skipped every test. Each must be `errored` or
   `timed_out` with the reason code that names it, and the known-bad control's crash must
-  leave the package unqualified. Confirm the result document is deleted before the process
-  starts, so a report left by a previous run cannot be replayed as this run's verdict, and
-  that a document path escaping the checkout or reached through a symbolic link is
-  `custody-invalid`. Confirm the document's text never reaches a published field, an
-  annotation, or standard output, and that no XML or parsing library was added to read it.
-  Confirm an exit-code-only package can still pass but can never claim a refutation.
+  leave the package unqualified. Exercise the skipped-suite case in jest-junit's shape as
+  well, where the `<testsuites>` root carries the totals and only the child `<testsuite>`
+  elements carry `skipped`: read from the root alone that report is a green suite that
+  exercised nothing, on the target run an owner trusts most. Confirm the result document is
+  deleted before the process starts, so a report left by a previous run cannot be replayed
+  as this run's verdict, and that a document path escaping the checkout, reached through a
+  symbolic link, or reached through a symbolically linked parent directory is
+  `custody-invalid` with nothing outside the checkout deleted. Confirm the document's text
+  never reaches a published field, an annotation, or standard output, and that no XML or
+  parsing library was added to read it. Confirm an exit-code-only package can still pass but
+  can never claim a refutation, and that its receipt says so in `resultProtocol` rather than
+  leaving the control plane to infer it.
+- **Receipt wire agreement:** confirm the qualification receipt's exact key set, including
+  `resultProtocol` and an explicit `null` `outcomeReason` on a control that reached a
+  verdict, is what the control plane's intake parses. A key this runner sends and the
+  server refuses answers HTTP 400 on the customer's default branch, reddens their check for
+  a Balladeer-side reason, and stores no receipt at all, so no fixture written on either
+  side alone is evidence: the check must run this release's own runner against the server's
+  own schemas.
 - **Protocol binding and replay:** exercise a good run plus wrong repository/owner IDs,
   wrong caller ref or workflow, wrong target/source SHA, stale or reused challenge,
   mismatched manifest/package digests, incomplete results, and a revoked attestor release.

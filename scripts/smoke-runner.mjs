@@ -9,6 +9,7 @@ import {
   canonicalize,
   packageDigest,
   qualificationSummary,
+  RESULT_SIGNALS,
   runAll,
   runTamperControl,
   runTarget,
@@ -231,6 +232,40 @@ try {
     },
     root,
   );
+  // The receipt's own key set is the contract the control plane's intake parses
+  // strictly. A key the runner sends and the server refuses answers 400 on the
+  // customer's default branch, and no server-side fixture written by hand can
+  // catch that, so the whole closed set is pinned here.
+  assert.deepEqual(Object.keys(qualification).sort(), [
+    "bindingId",
+    "controls",
+    "event",
+    "fixturesDigest",
+    "packageDigest",
+    "receiptId",
+    "recordedAt",
+    "ref",
+    "repository",
+    "repositoryId",
+    "resultProtocol",
+    "revisionId",
+    "runAttempt",
+    "runId",
+    "schemaVersion",
+    "semanticDigest",
+    "sourceSha",
+    "targetSha",
+    "verifierDigest",
+    "workflow",
+    "workflowDigest",
+    "workflowRef",
+    "workflowSha",
+    "workspaceLocator",
+  ]);
+  // How the verdicts were produced travels with the receipt. Without it every
+  // stored receipt looks pre-protocol and the control plane cannot say which
+  // bindings rest on controls that could not tell a crash from a refusal.
+  assert.equal(qualification.resultProtocol, "native");
   assert.deepEqual(Object.keys(qualification.controls).sort(), [
     "bad",
     "good",
@@ -526,6 +561,10 @@ try {
     `process.exit(${exitCode});\n`;
   const junitReport = ({ tests, failures = 0, errors = 0, skipped = 0 }) =>
     `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="smoke" tests="${tests}" failures="${failures}" errors="${errors}" skipped="${skipped}">\n<testsuite name="suite" tests="${tests}" failures="${failures}" errors="${errors}" skipped="${skipped}"></testsuite>\n</testsuites>\n`;
+  // jest-junit's actual shape: the root carries name, tests, failures, errors
+  // and time, and the skip count exists only on the child suites.
+  const junitSplitReport = ({ tests, failures = 0, errors = 0, skipped = 0 }) =>
+    `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="smoke" tests="${tests}" failures="${failures}" errors="${errors}" time="0.5">\n<testsuite name="suite" tests="${tests}" failures="${failures}" errors="${errors}" skipped="${skipped}" time="0.5"></testsuite>\n</testsuites>\n`;
 
   // Run one control of a purpose-built package and report what the runner made
   // of it. The label is the row of the derivation order being exercised.
@@ -586,6 +625,28 @@ try {
     "signal_killed",
   );
   assert.equal(signalled.signal, "SIGSEGV");
+
+  // A container that exhausts its CPU budget is killed with SIGXCPU, not with
+  // SIGKILL. Collapsed into `other` that is indistinguishable from an unknown
+  // signal, and the repair (raise the budget) is not the repair for anything
+  // else in the bucket. The verdict is unchanged either way; only the reason
+  // line a person reads gets more specific.
+  const cpuLimited = await assertScenario(
+    "Killed by the CPU limit",
+    { source: 'process.kill(process.pid, "SIGXCPU");\nsetTimeout(() => {}, 30000);\n' },
+    "errored",
+    "signal_killed",
+  );
+  assert.equal(cpuLimited.signal, "SIGXCPU");
+  // Its two siblings are pinned through the published allow-list rather than by
+  // spawning a process each: the closed list is what decides whether a name
+  // survives to the wire, and anything outside it still collapses to `other`.
+  for (const signal of ["SIGTRAP", "SIGXCPU", "SIGXFSZ"])
+    assert.equal(
+      RESULT_SIGNALS.includes(signal),
+      true,
+      `${signal} must survive to the wire by name rather than collapsing to other`,
+    );
 
   // The echo of a flooding verifier is the point of the bound, and it is
   // already exercised elsewhere; here only the outcome matters, so the echoed
@@ -697,6 +758,35 @@ try {
     "errored",
     "no_examples_ran",
   );
+  // The same suite written by jest-junit, whose `<testsuites>` root carries
+  // name, tests, failures, errors and time, and records `skipped` only on each
+  // child. Reading the root alone this is four tests that passed, so a promise
+  // whose verifier was left behind an env var CI stopped setting, or behind a
+  // `describe.skip`, would publish `pass` with four examples and reset the
+  // staleness clock. Only the child suites know the run exercised nothing.
+  await assertScenario(
+    "JUnit root omits skipped and every child skipped",
+    { junit: true, source: junitWriter(junitSplitReport({ tests: 4, skipped: 4 })) },
+    "errored",
+    "no_examples_ran",
+  );
+  // Understating is not the fix either: a report in the same shape where some
+  // examples really ran still reports what ran.
+  const partiallySkipped = await assertScenario(
+    "JUnit root omits skipped and some children skipped",
+    { junit: true, source: junitWriter(junitSplitReport({ tests: 4, skipped: 1 })) },
+    "pass",
+    null,
+  );
+  assert.equal(partiallySkipped.exampleTotal, 3);
+  // A child count that cannot be reconciled with the root's own total is not a
+  // report a verdict may be taken from.
+  await assertScenario(
+    "JUnit children skip more than the root ran",
+    { junit: true, source: junitWriter(junitSplitReport({ tests: 2, skipped: 3 })) },
+    "errored",
+    "result_unparseable",
+  );
 
   // Silence degrades to Unknown, never to a false pass, and can never claim a
   // refutation. That is the migration forcing function.
@@ -714,6 +804,22 @@ try {
     results: null,
   });
   assert.equal((await runTarget(undeclaredPass, root, sourceSha)).outcome, "pass");
+  // Such a package says so on its receipt. Its known-bad control can only ever
+  // report `errored`, so it can never qualify, and the receipt names the reason
+  // rather than leaving the control plane to infer it from a missing field.
+  const undeclaredReceipt = await buildQualificationRequest(
+    undeclaredPass,
+    {
+      schemaVersion: "continuity-qualification-meta/v1",
+      workspaceLocator: "3f1d9c2a-5b64-4a7e-9c31-8d2f6a0b4e57",
+      receiptId: "7c8e1b40-2d95-4f16-a3b8-51c7e9d0af62",
+      revisionId: "rev_smoke003",
+      bindingId: "bind_smoke003",
+      workflowDigest: sha256("smoke-workflow"),
+    },
+    root,
+  );
+  assert.equal(undeclaredReceipt.resultProtocol, "exit-code-only");
 
   // A document left by an earlier run is a replay vector. The runner deletes
   // the declared path before the process starts, so a verifier that writes
