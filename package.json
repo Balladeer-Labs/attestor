@@ -1,0 +1,27 @@
+{
+  "name": "@balladeer/attestor",
+  "version": "0.1.0",
+  "private": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Balladeer-Labs/attestor.git"
+  },
+  "type": "module",
+  "packageManager": "pnpm@10.25.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @balladeer/continuity-runner build",
+    "build:release": "tsc -p packages/continuity-runner/tsconfig.release.json",
+    "check:runner": "node scripts/check-runner-reproducible.mjs",
+    "test:runner": "node scripts/smoke-runner.mjs",
+    "typecheck": "pnpm --filter @balladeer/continuity-runner typecheck",
+    "check-release": "node scripts/check-release.mjs && node scripts/check-runner-reproducible.mjs && node scripts/smoke-runner.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "typescript": "5.9.3"
+  }
+}

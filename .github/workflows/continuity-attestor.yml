@@ -1,0 +1,345 @@
+name: Balladeer continuity attestor
+
+# This is deliberately callable only by immutable SHA from a customer-owned
+# trigger workflow. GitHub binds its identity into OIDC as job_workflow_ref and
+# job_workflow_sha; the service refuses every token without that exact pair.
+on:
+  workflow_call:
+    inputs:
+      workspace_locator:
+        description: Non-secret tenant locator supplied by Balladeer setup.
+        required: true
+        type: string
+      default_branch:
+        description: Customer repository default branch, used only for qualification.
+        required: true
+        type: string
+
+permissions: {}
+
+# Do not turn these into caller inputs, vars, or secrets. A caller-selectable
+# endpoint/audience could exfiltrate an attestor-bound OIDC token to an attacker.
+env:
+  BALLADEER_CONTROL_PLANE_URL: https://attest.balladeer.ai
+  BALLADEER_OIDC_AUDIENCE: https://attest.balladeer.ai
+
+jobs:
+  register:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    outputs:
+      target_id: ${{ steps.register.outputs.target_id }}
+      manifest_digest: ${{ steps.register.outputs.manifest_digest }}
+      challenge: ${{ steps.register.outputs.challenge }}
+      manifest_b64: ${{ steps.register.outputs.manifest_b64 }}
+    steps:
+      - id: register
+        name: Register caller target and freeze active manifest
+        env:
+          WORKSPACE_LOCATOR: ${{ inputs.workspace_locator }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REPOSITORY_ID: ${{ github.repository_id }}
+          GH_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          GH_REF: ${{ github.ref }}
+          GH_WORKFLOW: ${{ github.workflow }}
+          GH_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GH_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_EVENT: ${{ github.event_name }}
+          GH_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_BASE_SHA" && test "$GH_BASE_SHA" != '0000000000000000000000000000000000000000'
+          token="$(curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BALLADEER_OIDC_AUDIENCE" | jq -er .value)"
+          # A control-plane refusal has to be readable by the customer who hit it, so the
+          # response body goes to a file and only the HTTP status reaches stdout. On a
+          # non-2xx status the bounded server error body is printed before this step
+          # fails. The request is unchanged, and no request header or bearer token is
+          # ever printed.
+          response_path="$RUNNER_TEMP/balladeer-register-response.json"
+          status="$(curl --connect-timeout 10 --max-time 30 --silent --show-error --output "$response_path" --write-out '%{http_code}' -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/targets/register" \
+            -H 'content-type: application/json' -H "authorization: Bearer $token" \
+            -d "$(jq -n --arg workspaceLocator "$WORKSPACE_LOCATOR" --arg repository "$GH_REPOSITORY" --arg repositoryId "$GH_REPOSITORY_ID" --arg repositoryOwnerId "$GH_REPOSITORY_OWNER_ID" --arg ref "$GH_REF" --arg workflow "$GH_WORKFLOW" --arg workflowRef "$GH_WORKFLOW_REF" --arg workflowSha "$GH_WORKFLOW_SHA" --arg runId "$GH_RUN_ID" --argjson runAttempt "$GH_RUN_ATTEMPT" --arg event "$GH_EVENT" --arg baseSha "$GH_BASE_SHA" --arg headSha "$GH_HEAD_SHA" --arg targetSha "$GH_TARGET_SHA" '{workspaceLocator:$workspaceLocator,repository:$repository,repositoryId:$repositoryId,repositoryOwnerId:$repositoryOwnerId,ref:$ref,workflow:$workflow,workflowRef:$workflowRef,workflowSha:$workflowSha,runId:$runId,runAttempt:$runAttempt,event:$event,baseSha:$baseSha,headSha:$headSha,targetSha:$targetSha}')")"
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Balladeer registration refused: HTTP status $status."
+            if [[ -s "$response_path" ]]; then
+              echo "Control-plane response body (first 4096 bytes):"
+              head -c 4096 -- "$response_path"
+              echo
+            else
+              echo "The control plane returned no response body."
+            fi
+            exit 1
+          fi
+          response="$(cat "$response_path")"
+          target_id="$(jq -er '.targetId | select(test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))' <<<"$response")"
+          manifest_digest="$(jq -er '.manifestDigest | select(test("^sha256:[a-f0-9]{64}$"))' <<<"$response")"
+          challenge="$(jq -er '.challenge | select(length >= 32 and length <= 256 and test("^[A-Za-z0-9_-]+$"))' <<<"$response")"
+          jq -e --arg targetId "$target_id" --arg digest "$manifest_digest" '.manifest | .schemaVersion == "continuity-ci/v1" and .targetId == $targetId and .manifestDigest == $digest and (.promises | type == "array")' <<<"$response" >/dev/null
+          printf 'target_id=%s\n' "$target_id" >> "$GITHUB_OUTPUT"
+          printf 'manifest_digest=%s\n' "$manifest_digest" >> "$GITHUB_OUTPUT"
+          printf 'challenge=%s\n' "$challenge" >> "$GITHUB_OUTPUT"
+          manifest_b64="$(jq -c .manifest <<<"$response" | base64 | tr -d '\n')"
+          test -n "$manifest_b64" && test "${#manifest_b64}" -le 900000
+          printf 'manifest_b64=%s\n' "$manifest_b64" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: register
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # This is the only job that sees customer checkout. It cannot mint OIDC.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.18.0
+      - name: Fetch immutable attestor runner outside customer checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # GitHub's job context identifies the reusable workflow defining this job.
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .balladeer-attestor-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          persist-credentials: false
+      - name: Activate immutable prebuilt attestor runner
+        env:
+          ATTESTOR_REPOSITORY: ${{ job.workflow_repository }}
+          ATTESTOR_WORKFLOW_REF: ${{ job.workflow_ref }}
+          ATTESTOR_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          ATTESTOR_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          stage_dir=".balladeer-attestor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          runner_dir="$RUNNER_TEMP/balladeer-attestor-${ATTESTOR_WORKFLOW_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test "$ATTESTOR_REPOSITORY" = 'Balladeer-Labs/attestor'
+          test "$ATTESTOR_WORKFLOW_FILE_PATH" = '.github/workflows/continuity-attestor.yml'
+          test "$ATTESTOR_WORKFLOW_REF" = "$ATTESTOR_REPOSITORY/$ATTESTOR_WORKFLOW_FILE_PATH@$ATTESTOR_WORKFLOW_SHA"
+          test "$(git -C "$stage_dir" rev-parse HEAD)" = "$ATTESTOR_WORKFLOW_SHA"
+          test ! -e "$runner_dir"
+          mv -- "$stage_dir" "$runner_dir"
+          chmod -R a-w "$runner_dir"
+          test -f "$runner_dir/release/continuity-runner/cli.js"
+          test -f "$runner_dir/release/continuity-runner/index.js"
+          echo "BALLADEER_TRUSTED_RUNNER=$runner_dir/release/continuity-runner/cli.js" >> "$GITHUB_ENV"
+      - name: Run every active verifier locally
+        env:
+          BALLADEER_TARGET_ID: ${{ needs.register.outputs.target_id }}
+          BALLADEER_MANIFEST_DIGEST: ${{ needs.register.outputs.manifest_digest }}
+          BALLADEER_MANIFEST_B64: ${{ needs.register.outputs.manifest_b64 }}
+          BALLADEER_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          result_path="$RUNNER_TEMP/continuity-results.json"
+          manifest_path="$RUNNER_TEMP/continuity-manifest.json"
+          printf '%s' "$BALLADEER_MANIFEST_B64" | base64 --decode > "$manifest_path"
+          node "$BALLADEER_TRUSTED_RUNNER" run-manifest-target .continuity/packages "$manifest_path" > "$result_path"
+          echo "RESULT_PATH=$result_path" >> "$GITHUB_ENV"
+      - name: Upload closed result only
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: continuity-closed-result
+          path: ${{ env.RESULT_PATH }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Report target regressions as an advisory check
+        run: |
+          set -euo pipefail
+          # The check is still red for anything but a pass, and it now says which
+          # kind of not-a-pass it is. Only a refutation is a caught regression; a
+          # verifier that could not decide must never be read as one.
+          if jq -e 'any(.results[]; .outcome == "refuted")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer: a protected behavior was refuted by its verifier. This is a caught regression."
+            jq -r '.results[] | select(.outcome == "refuted") | "\(.promiseId): refuted"' "$RESULT_PATH"
+          fi
+          if jq -e 'any(.results[]; .outcome == "errored" or .outcome == "timed_out")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer: a verifier could not produce a verdict. This is not a regression; the check could not run."
+            jq -r '.results[] | select(.outcome == "errored" or .outcome == "timed_out") | "\(.promiseId): \(.outcome) (\(.outcomeReason // "unspecified"))"' "$RESULT_PATH"
+          fi
+          if jq -e 'any(.results[]; .outcome == "canceled" or .outcome == "custody-invalid")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer advisory check: at least one active promise is inconclusive."
+            jq -r '.results[] | select(.outcome == "canceled" or .outcome == "custody-invalid") | "\(.promiseId): \(.outcome)"' "$RESULT_PATH"
+          fi
+          if jq -e 'any(.results[]; .outcome != "pass")' "$RESULT_PATH" >/dev/null; then
+            exit 1
+          fi
+          if jq -e '(.results | length) == 0' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer setup check: workflow identity authenticated; no active promises exist yet."
+          fi
+
+  publish:
+    if: ${{ always() && needs.register.result == 'success' }}
+    needs: [register, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No checkout: only the closed results artifact reaches token-bearing code.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        continue-on-error: true
+        with:
+          name: continuity-closed-result
+      - name: Publish closed target results
+        env:
+          WORKSPACE_LOCATOR: ${{ inputs.workspace_locator }}
+          TARGET_ID: ${{ needs.register.outputs.target_id }}
+          MANIFEST_DIGEST: ${{ needs.register.outputs.manifest_digest }}
+          CHALLENGE: ${{ needs.register.outputs.challenge }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! -s continuity-results.json ]]; then
+            echo "No closed target result artifact; reconciliation must record this run as missing or unknown."
+            exit 0
+          fi
+          token="$(curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BALLADEER_OIDC_AUDIENCE" | jq -er .value)"
+          jq --arg workspaceLocator "$WORKSPACE_LOCATOR" --arg targetId "$TARGET_ID" --arg manifestDigest "$MANIFEST_DIGEST" --arg runId "$GH_RUN_ID" --arg challenge "$CHALLENGE" '{schemaVersion:"continuity-ci/v1",mode:"target",workspaceLocator:$workspaceLocator,targetId:$targetId,manifestDigest:$manifestDigest,runId:$runId,challenge:$challenge,results:.results,shadowApplicability:(reduce .results[] as $r ({}; .[$r.promiseId] = null))}' continuity-results.json > publish.json
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/results" \
+            -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @publish.json
+
+  qualify-controls:
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch)
+    needs: register
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      has_receipts: ${{ steps.qualify.outputs.has_receipts }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.18.0
+      - name: Fetch immutable attestor runner outside customer checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .balladeer-attestor-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          persist-credentials: false
+      - name: Activate immutable prebuilt attestor runner
+        env:
+          ATTESTOR_REPOSITORY: ${{ job.workflow_repository }}
+          ATTESTOR_WORKFLOW_REF: ${{ job.workflow_ref }}
+          ATTESTOR_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          ATTESTOR_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          stage_dir=".balladeer-attestor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          runner_dir="$RUNNER_TEMP/balladeer-attestor-${ATTESTOR_WORKFLOW_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test "$ATTESTOR_REPOSITORY" = 'Balladeer-Labs/attestor'
+          test "$ATTESTOR_WORKFLOW_FILE_PATH" = '.github/workflows/continuity-attestor.yml'
+          test "$ATTESTOR_WORKFLOW_REF" = "$ATTESTOR_REPOSITORY/$ATTESTOR_WORKFLOW_FILE_PATH@$ATTESTOR_WORKFLOW_SHA"
+          test "$(git -C "$stage_dir" rev-parse HEAD)" = "$ATTESTOR_WORKFLOW_SHA"
+          test ! -e "$runner_dir"
+          mv -- "$stage_dir" "$runner_dir"
+          chmod -R a-w "$runner_dir"
+          test -f "$runner_dir/release/continuity-runner/cli.js"
+          test -f "$runner_dir/release/continuity-runner/index.js"
+          echo "BALLADEER_TRUSTED_RUNNER=$runner_dir/release/continuity-runner/cli.js" >> "$GITHUB_ENV"
+      - id: qualify
+        name: Create closed qualification receipts
+        env:
+          BALLADEER_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          request_dir="$RUNNER_TEMP/continuity-qualification-requests"
+          mkdir -p "$request_dir"
+          shopt -s nullglob
+          metadata_files=(.continuity/qualification/*.json)
+          if [[ "${#metadata_files[@]}" -eq 0 ]]; then
+            echo "has_receipts=false" >> "$GITHUB_OUTPUT"
+            echo "No pending qualification metadata; continuing without a qualification artifact."
+            exit 0
+          fi
+          echo "has_receipts=true" >> "$GITHUB_OUTPUT"
+          for metadata in "${metadata_files[@]}"; do
+            promise_id="$(basename "$metadata" .json)"
+            package=".continuity/packages/${promise_id}.json"
+            node "$BALLADEER_TRUSTED_RUNNER" qualification-request "$package" "$metadata" "$request_dir/${promise_id}.json"
+          done
+          echo "QUALIFICATION_REQUEST_DIR=$request_dir" >> "$GITHUB_ENV"
+      - name: Upload closed qualification receipts only
+        if: steps.qualify.outputs.has_receipts == 'true'
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: continuity-qualification-receipts
+          path: ${{ env.QUALIFICATION_REQUEST_DIR }}/*.json
+          if-no-files-found: error
+          retention-days: 1
+
+  qualify-publish:
+    if:
+      github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch)
+      && needs.qualify-controls.outputs.has_receipts == 'true'
+    needs: qualify-controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No checkout: this publisher sees only closed receipt JSON.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: continuity-qualification-receipts
+          path: qualification-requests
+      - name: Publish closed qualification receipts
+        run: |
+          set -euo pipefail
+          token="$(curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BALLADEER_OIDC_AUDIENCE" | jq -er .value)"
+          shopt -s nullglob
+          receipts=(qualification-requests/*.json)
+          test "${#receipts[@]}" -gt 0
+          for receipt in "${receipts[@]}"; do
+            curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/qualification-receipts" \
+              -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @"$receipt"
+          done
+
+  # The gate runs after publication, never instead of it. A control that could
+  # not decide still owes the control plane its receipt: that is what records
+  # the promise as unqualified with the reason. Failing the job before the
+  # receipt is sent would leave the binding silently unqualified and the job
+  # green, which is the third way a crash used to pass for evidence.
+  qualify-gate:
+    if: ${{ always() && needs.qualify-controls.result == 'success' && needs.qualify-controls.outputs.has_receipts == 'true' }}
+    needs: [qualify-controls, qualify-publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No checkout and no OIDC: this job reads closed receipts only.
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: continuity-qualification-receipts
+          path: qualification-requests
+      - name: Refuse a control that could not decide
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          receipts=(qualification-requests/*.json)
+          test "${#receipts[@]}" -gt 0
+          undecided=0
+          for receipt in "${receipts[@]}"; do
+            if jq -e 'any(.controls | to_entries[]; .value.outcome == "errored" or .value.outcome == "timed_out" or .value.outcome == "canceled")' "$receipt" >/dev/null; then
+              undecided=1
+              jq -r '.controls | to_entries[] | select(.value.outcome == "errored" or .value.outcome == "timed_out" or .value.outcome == "canceled") | "\(.key) control: \(.value.outcome) (\(.value.outcomeReason // "unspecified"))"' "$receipt"
+            fi
+          done
+          if [[ "$undecided" != 0 ]]; then
+            echo "Balladeer: a qualification control could not produce a verdict, so this promise cannot be qualified. A crashed control says nothing about whether the verifier can tell a broken behavior from a working one."
+            exit 1
+          fi

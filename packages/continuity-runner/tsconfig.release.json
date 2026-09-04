@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../release/continuity-runner",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  }
+}
