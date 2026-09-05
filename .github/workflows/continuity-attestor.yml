@@ -34,6 +34,10 @@ jobs:
       manifest_digest: ${{ steps.register.outputs.manifest_digest }}
       challenge: ${{ steps.register.outputs.challenge }}
       manifest_b64: ${{ steps.register.outputs.manifest_b64 }}
+      shard_vector: ${{ steps.register.outputs.shard_vector }}
+      shard_count: ${{ steps.register.outputs.shard_count }}
+      max_parallel: ${{ steps.register.outputs.max_parallel }}
+      shard_timeout_minutes: ${{ steps.register.outputs.shard_timeout_minutes }}
     steps:
       - id: register
         name: Register caller target and freeze active manifest
@@ -87,11 +91,43 @@ jobs:
           manifest_b64="$(jq -c .manifest <<<"$response" | base64 | tr -d '\n')"
           test -n "$manifest_b64" && test "${#manifest_b64}" -le 900000
           printf 'manifest_b64=%s\n' "$manifest_b64" >> "$GITHUB_OUTPUT"
+          # How the control plane wants this run's verification fanned out. It is
+          # advice, not authority: the exact set of promises that must be verified
+          # is the frozen manifest above, and the control plane's cardinality check
+          # is unchanged.
+          #
+          # Every value is bounded here before it can shape a matrix, and every
+          # value that fails its bound falls back to one shard, which is exactly
+          # what this workflow did before the fan-out existed. That fallback is
+          # what lets this release be enrolled before OR after the control plane
+          # that answers `sharding` is deployed: an older control plane sends none,
+          # and the run verifies serially and publishes, as it does today.
+          sharding="$(jq -c '.sharding // {}' <<<"$response")"
+          shard_count="$(jq -r 'if ((.shardCount|type)=="number" and .shardCount>=1 and .shardCount<=256 and (.shardCount|floor)==.shardCount) then .shardCount else 1 end' <<<"$sharding")"
+          max_parallel="$(jq -r --argjson c "$shard_count" 'if ((.maxParallel|type)=="number" and .maxParallel>=1 and .maxParallel<=$c and (.maxParallel|floor)==.maxParallel) then .maxParallel else $c end' <<<"$sharding")"
+          shard_timeout="$(jq -r 'if ((.shardTimeoutMinutes|type)=="number" and .shardTimeoutMinutes>=1 and .shardTimeoutMinutes<=45 and (.shardTimeoutMinutes|floor)==.shardTimeoutMinutes) then .shardTimeoutMinutes else 30 end' <<<"$sharding")"
+          shard_vector="$(jq -c --argjson c "$shard_count" 'if .shards == [range($c)] then .shards else [range($c)] end' <<<"$sharding")"
+          printf 'shard_count=%s\n' "$shard_count" >> "$GITHUB_OUTPUT"
+          printf 'max_parallel=%s\n' "$max_parallel" >> "$GITHUB_OUTPUT"
+          printf 'shard_timeout_minutes=%s\n' "$shard_timeout" >> "$GITHUB_OUTPUT"
+          printf 'shard_vector=%s\n' "$shard_vector" >> "$GITHUB_OUTPUT"
 
   verify:
     needs: register
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: ${{ fromJSON(needs.register.outputs.shard_timeout_minutes) }}
+    # One shard of the fan-out. Every shard resolves and digest-checks the WHOLE
+    # frozen manifest and then runs only its own deterministic slice, so sharding
+    # narrows what a job executes and never narrows what it validates.
+    #
+    # fail-fast is false on purpose: one shard's refutation must not cancel the
+    # others, because a cancelled shard reports nothing and its promises would
+    # lose their evidence to a failure that had nothing to do with them.
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.register.outputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJSON(needs.register.outputs.shard_vector) }}
     # This is the only job that sees customer checkout. It cannot mint OIDC.
     permissions:
       contents: read
@@ -137,17 +173,20 @@ jobs:
           BALLADEER_MANIFEST_DIGEST: ${{ needs.register.outputs.manifest_digest }}
           BALLADEER_MANIFEST_B64: ${{ needs.register.outputs.manifest_b64 }}
           BALLADEER_SOURCE_SHA: ${{ github.sha }}
+          BALLADEER_SHARD_INDEX: ${{ matrix.shard }}
+          BALLADEER_SHARD_COUNT: ${{ needs.register.outputs.shard_count }}
         run: |
           set -euo pipefail
-          result_path="$RUNNER_TEMP/continuity-results.json"
+          result_path="$RUNNER_TEMP/continuity-results-$BALLADEER_SHARD_INDEX.json"
           manifest_path="$RUNNER_TEMP/continuity-manifest.json"
           printf '%s' "$BALLADEER_MANIFEST_B64" | base64 --decode > "$manifest_path"
-          node "$BALLADEER_TRUSTED_RUNNER" run-manifest-target .continuity/packages "$manifest_path" > "$result_path"
+          node "$BALLADEER_TRUSTED_RUNNER" run-manifest-target .continuity/packages "$manifest_path" \
+            --shard "$BALLADEER_SHARD_INDEX" --shards "$BALLADEER_SHARD_COUNT" > "$result_path"
           echo "RESULT_PATH=$result_path" >> "$GITHUB_ENV"
       - name: Upload closed result only
         uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
         with:
-          name: continuity-closed-result
+          name: continuity-shard-result-${{ matrix.shard }}
           path: ${{ env.RESULT_PATH }}
           if-no-files-found: error
           retention-days: 1
@@ -176,9 +215,103 @@ jobs:
             echo "Balladeer setup check: workflow identity authenticated; no active promises exist yet."
           fi
 
+  merge:
+    # `!cancelled()` rather than `always()`: a run the customer cancelled should
+    # publish nothing, exactly as before. A shard that died on its own still
+    # reaches the merge, which is the whole point.
+    if: ${{ !cancelled() && needs.register.result == 'success' }}
+    needs: [register, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # No OIDC and no customer checkout. This job joins closed result documents
+    # and answers for the shards that never reported; it cannot authenticate to
+    # anything. `contents: read` is only what `actions/checkout` wants to fetch
+    # the public attestor repository, which is the only tree it sees.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.18.0
+      - name: Fetch immutable attestor runner outside customer checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .balladeer-attestor-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          persist-credentials: false
+      - name: Activate immutable prebuilt attestor runner
+        env:
+          ATTESTOR_REPOSITORY: ${{ job.workflow_repository }}
+          ATTESTOR_WORKFLOW_REF: ${{ job.workflow_ref }}
+          ATTESTOR_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          ATTESTOR_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          stage_dir=".balladeer-attestor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          runner_dir="$RUNNER_TEMP/balladeer-attestor-${ATTESTOR_WORKFLOW_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test "$ATTESTOR_REPOSITORY" = 'Balladeer-Labs/attestor'
+          test "$ATTESTOR_WORKFLOW_FILE_PATH" = '.github/workflows/continuity-attestor.yml'
+          test "$ATTESTOR_WORKFLOW_REF" = "$ATTESTOR_REPOSITORY/$ATTESTOR_WORKFLOW_FILE_PATH@$ATTESTOR_WORKFLOW_SHA"
+          test "$(git -C "$stage_dir" rev-parse HEAD)" = "$ATTESTOR_WORKFLOW_SHA"
+          test ! -e "$runner_dir"
+          mv -- "$stage_dir" "$runner_dir"
+          chmod -R a-w "$runner_dir"
+          test -f "$runner_dir/release/continuity-runner/cli.js"
+          test -f "$runner_dir/release/continuity-runner/index.js"
+          echo "BALLADEER_TRUSTED_RUNNER=$runner_dir/release/continuity-runner/cli.js" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        continue-on-error: true
+        with:
+          pattern: continuity-shard-result-*
+          path: shards
+      - name: Merge every shard's closed results in promise order
+        env:
+          BALLADEER_MANIFEST_B64: ${{ needs.register.outputs.manifest_b64 }}
+          BALLADEER_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p shards
+          manifest_path="$RUNNER_TEMP/continuity-manifest.json"
+          merged_path="$RUNNER_TEMP/continuity-results.json"
+          printf '%s' "$BALLADEER_MANIFEST_B64" | base64 --decode > "$manifest_path"
+          # A shard that never reported gets one closed `errored` result per
+          # promise it owned, carrying the reason `shard_failed`. Publication
+          # cardinality therefore stays exact, the promises that did report keep
+          # their real verdict, and the ones that did not read Unknown with the
+          # reason named rather than taking the whole repository down with them.
+          node "$BALLADEER_TRUSTED_RUNNER" merge-shard-results "$manifest_path" shards "$merged_path"
+          echo "RESULT_PATH=$merged_path" >> "$GITHUB_ENV"
+      - name: Upload the one closed result the publisher posts
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: continuity-closed-result
+          path: ${{ env.RESULT_PATH }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Report the whole catalog's verdict as one advisory check
+        run: |
+          set -euo pipefail
+          # After the upload, never before it: the publisher must still receive
+          # the merged document when this gate is about to go red.
+          if jq -e 'any(.results[]; .outcome == "refuted")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer: a protected behavior was refuted by its verifier. This is a caught regression."
+            jq -r '.results[] | select(.outcome == "refuted") | "\(.promiseId): refuted"' "$RESULT_PATH"
+          fi
+          if jq -e 'any(.results[]; .outcomeReason == "shard_failed")' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer: one of our own verification jobs did not report, so these promises have no evidence from this run. This is our infrastructure failing, not a refuted test."
+            jq -r '.results[] | select(.outcomeReason == "shard_failed") | "\(.promiseId): no verification job reported"' "$RESULT_PATH"
+          fi
+          if jq -e 'any(.results[]; .outcome != "pass")' "$RESULT_PATH" >/dev/null; then
+            exit 1
+          fi
+          if jq -e '(.results | length) == 0' "$RESULT_PATH" >/dev/null; then
+            echo "Balladeer setup check: workflow identity authenticated; no active promises exist yet."
+          fi
+
   publish:
     if: ${{ always() && needs.register.result == 'success' }}
-    needs: [register, verify]
+    needs: [register, merge]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # No checkout: only the closed results artifact reaches token-bearing code.

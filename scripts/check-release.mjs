@@ -113,6 +113,7 @@ const jobBody = (name) => {
 };
 const registerJob = jobBody("register");
 const verifyJob = jobBody("verify");
+const mergeJob = jobBody("merge");
 const publishJob = jobBody("publish");
 const qualifyControlsJob = jobBody("qualify-controls");
 const qualifyPublishJob = jobBody("qualify-publish");
@@ -142,11 +143,11 @@ const assertions = [
   [!allText.includes(["control.balladeer", "invalid"].join(".")), "no placeholder origin"],
   [!/^\s+(control_plane_url|balladeer_url|oidc_audience):/m.test(workflow), "no caller endpoint inputs"],
   [
-    (workflow.match(/repository: \$\{\{ job\.workflow_repository \}\}/g) ?? []).length === 2,
+    (workflow.match(/repository: \$\{\{ job\.workflow_repository \}\}/g) ?? []).length === 3,
     "GitHub-selected attestor repository",
   ],
   [
-    (workflow.match(/ref: \$\{\{ job\.workflow_sha \}\}/g) ?? []).length === 2,
+    (workflow.match(/ref: \$\{\{ job\.workflow_sha \}\}/g) ?? []).length === 3,
     "GitHub-selected attestor SHA",
   ],
   [
@@ -155,18 +156,18 @@ const assertions = [
     "server response cannot select executable",
   ],
   [
-    (workflow.match(/ATTESTOR_WORKFLOW_REF: \$\{\{ job\.workflow_ref \}\}/g) ?? []).length === 2 &&
+    (workflow.match(/ATTESTOR_WORKFLOW_REF: \$\{\{ job\.workflow_ref \}\}/g) ?? []).length === 3 &&
       (workflow.match(/ATTESTOR_WORKFLOW_FILE_PATH: \$\{\{ job\.workflow_file_path \}\}/g) ?? [])
-        .length === 2,
+        .length === 3,
     "GitHub workflow identity is captured",
   ],
   [
-    (workflow.match(/git -C "\$stage_dir" rev-parse HEAD/g) ?? []).length === 2,
+    (workflow.match(/git -C "\$stage_dir" rev-parse HEAD/g) ?? []).length === 3,
     "attestor checkout HEAD is verified",
   ],
   [
     (workflow.match(/\.balladeer-attestor-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ github\.job \}\}/g) ?? [])
-      .length === 2,
+      .length === 3,
     "run-derived attestor staging paths",
   ],
   [workflow.includes("release/continuity-runner/cli.js"), "prebuilt runner execution"],
@@ -179,16 +180,16 @@ const assertions = [
   ],
   [
     (workflow.match(/actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/g) ?? [])
-      .length === 2 &&
-      (workflow.match(/node-version: 22\.18\.0/g) ?? []).length === 2,
+      .length === 3 &&
+      (workflow.match(/node-version: 22\.18\.0/g) ?? []).length === 3,
     "source-reading jobs pin Node 22.18.0",
   ],
   [
-    (workflow.match(/runs-on: ubuntu-24\.04/g) ?? []).length === 6 &&
+    (workflow.match(/runs-on: ubuntu-24\.04/g) ?? []).length === 7 &&
       !workflow.includes("ubuntu-latest"),
     "attestor jobs pin Ubuntu 24.04",
   ],
-  [(workflow.match(/timeout-minutes:/g) ?? []).length === 6, "every attestor job has a timeout"],
+  [(workflow.match(/timeout-minutes:/g) ?? []).length === 7, "every attestor job has a timeout"],
   [
     curlLines.length > 0 &&
       curlLines.every(
@@ -209,7 +210,9 @@ const assertions = [
     "token-bearing jobs never checkout source",
   ],
   [
-    !verifyJob.includes("id-token: write") && !qualifyControlsJob.includes("id-token: write"),
+    !verifyJob.includes("id-token: write") &&
+      !qualifyControlsJob.includes("id-token: write") &&
+      !mergeJob.includes("id-token: write"),
     "source-reading jobs cannot mint OIDC",
   ],
   [workflow.includes("persist-credentials: false"), "checkout credentials disabled"],

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from "node:fs/promises";
-import { announceRun, assertPackageReady, buildQualificationRequest, createOffboardingExport, qualificationSummary, readAvailablePackages, readPackages, scaffoldPackage, runAllPackages, runManifestEntries, runOne, runTarget, runTamperControls, sealPackageDraft, selectManifestEntries, validateExecutionManifest, } from "./index.js";
+import { readdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { announceMerge, announceRun, assertPackageReady, buildQualificationRequest, createOffboardingExport, mergeShardOutputs, qualificationSummary, readAvailablePackages, readPackages, reportLocalTargetExit, runOutputDocument, scaffoldPackage, runAllPackages, runManifestEntries, runOne, runTarget, runTamperControls, sealPackageDraft, selectManifestEntries, shardSelections, validateExecutionManifest, } from "./index.js";
 // Standard output and standard error are pipes in GitHub Actions, so writes to
 // them complete asynchronously. Exiting immediately after a write can drop it.
 // Every exit path drains both channels first: the closed result on stdout and
@@ -13,15 +14,66 @@ const drainOutput = async () => {
         process.stderr.write("", () => resolve());
     });
 };
-const [command, packagePath, auxiliary, outputPath] = process.argv.slice(2);
+/**
+ * Options are read before positionals, so every existing invocation keeps the
+ * exact argument order it had. `--shard`/`--shards` are the only ones, and both
+ * default to the unsharded run.
+ */
+const options = new Map();
+const positional = [];
+{
+    const argv = process.argv.slice(2);
+    for (let cursor = 0; cursor < argv.length; cursor += 1) {
+        const token = argv[cursor];
+        if (!token.startsWith("--")) {
+            positional.push(token);
+            continue;
+        }
+        const separator = token.indexOf("=");
+        if (separator === -1) {
+            options.set(token.slice(2), argv[cursor + 1] ?? "");
+            cursor += 1;
+        }
+        else
+            options.set(token.slice(2, separator), token.slice(separator + 1));
+    }
+}
+const wholeNumber = (name, fallback) => {
+    const raw = options.get(name);
+    if (raw === undefined)
+        return fallback;
+    if (!/^[0-9]{1,6}$/.test(raw))
+        throw new Error(`--${name} must be a whole number`);
+    return Number(raw);
+};
+const [command, packagePath, auxiliary, outputPath] = positional;
 if (!command || !packagePath) {
-    console.error("usage: continuity-runner <scaffold|seal|validate-package|qualify|qualification-request|run-one|run-one-target|run-all|run-manifest-target|exercise|offboarding> <package-or-draft-path> [control|manifest|metadata] [output]");
+    console.error("usage: continuity-runner <scaffold|seal|validate-package|qualify|qualification-request|run-one|run-one-target|run-all|run-manifest-target|merge-shard-results|exercise|offboarding> <package-or-draft-path> [control|manifest|metadata|promise-id] [output|promise-facts.json] [--shard N --shards K]\n" +
+        '  scaffold .continuity <promise-id> [promise-facts.json]  promise-facts.json is {"claim":..., "owner":..., "promiseUrl":...}, read off the promise\n' +
+        "  run-one-target exits 0 when the behavior holds, 1 when it is refuted, 3 when the check could not run, 4 when custody is invalid\n" +
+        "  run-manifest-target --shard N --shards K runs one shard of the fan-out; the merge joins them\n" +
+        "  merge-shard-results <manifest> <shard-results-dir> [output]  joins every shard in promise order");
     await drainOutput();
     process.exit(2);
 }
 try {
     if (command === "scaffold") {
-        const result = await scaffoldPackage(packagePath, auxiliary);
+        // The optional fourth argument is a small JSON file holding the three facts
+        // that are not derivable from the promise id: the sentence the owner
+        // approved, the owner's name, and the promise's page. An agent reads them
+        // off `get_promise` and writes them here, and the starter comes out already
+        // able to name what it protects. Left out, the starter carries placeholders
+        // and `seal` refuses them.
+        const facts = outputPath
+            ? (JSON.parse(await readFile(outputPath, "utf8")) ?? undefined)
+            : undefined;
+        if (facts !== undefined) {
+            const named = ["claim", "owner", "promiseUrl"];
+            const missing = named.filter((key) => typeof facts[key] !== "string" || !facts[key].trim());
+            if (missing.length > 0)
+                throw new Error(`scaffold facts file must carry ${named.join(", ")} as non-empty strings; missing or empty: ${missing.join(", ")}`);
+        }
+        const result = await scaffoldPackage(packagePath, auxiliary, process.cwd(), facts);
         console.log(JSON.stringify({ scaffolded: true, ...result }));
         await drainOutput();
         process.exit(0);
@@ -59,24 +111,71 @@ try {
         await drainOutput();
         process.exit(0);
     }
-    if (command === "run-manifest" || command === "run-manifest-target") {
+    if (command === "merge-shard-results") {
+        // The merge sees closed result documents and the frozen manifest. It never
+        // sees customer source, and it holds no token: it runs in its own job so
+        // that the publisher's no-checkout boundary is unchanged.
+        if (!auxiliary)
+            throw new Error("merge-shard-results requires a shard results directory");
+        const manifest = validateExecutionManifest(JSON.parse(await readFile(packagePath, "utf8")));
+        const sourceSha = process.env.BALLADEER_SOURCE_SHA ?? process.env.GITHUB_SHA ?? "";
+        const files = [];
+        const walk = async (directory) => {
+            for (const entry of await readdir(directory, { withFileTypes: true })) {
+                const path = join(directory, entry.name);
+                // Symbolic links are not followed: an artifact is a directory of files.
+                if (entry.isDirectory())
+                    await walk(path);
+                else if (entry.isFile() && entry.name.endsWith(".json"))
+                    files.push(path);
+            }
+        };
+        await walk(auxiliary);
+        files.sort();
+        // The artifacts are read one at a time, in sorted path order. The public
+        // release gate reads "verifier controls and packages execute serially" off
+        // this source as a plain text scan, so no concurrent promise combinator may
+        // appear in this file or in `index.ts`. Nothing is owed to concurrency
+        // here: the merge reads a handful of small closed result documents, and the
+        // sequential read also makes a failure deterministic, because the first
+        // unreadable artifact in path order is the one that is reported.
+        const documents = [];
+        for (const path of files)
+            documents.push(JSON.parse(await readFile(path, "utf8")));
+        const report = mergeShardOutputs(manifest, documents, sourceSha);
+        await announceMerge(report);
+        const merged = {
+            schemaVersion: "continuity-run-output/v1",
+            mode: "target",
+            manifestDigest: report.manifestDigest,
+            shard: { index: 0, count: 1 },
+            sourceSha,
+            results: report.results,
+        };
+        const serialized = JSON.stringify(merged);
+        if (outputPath)
+            await writeFile(outputPath, serialized + "\n", "utf8");
+        else
+            console.log(serialized);
+    }
+    else if (command === "run-manifest" || command === "run-manifest-target") {
         if (!auxiliary)
             throw new Error("run-manifest-target requires a frozen manifest path");
         const manifest = validateExecutionManifest(JSON.parse(await readFile(auxiliary, "utf8")));
         const mode = command === "run-manifest-target" ? "target" : "exercise";
+        const shard = {
+            index: wholeNumber("shard", 0),
+            count: wholeNumber("shards", 1),
+        };
         // One missing, re-sealed, or unreadable package must not blank the catalog.
         // Read what is readable, resolve every manifest entry on its own, and let
-        // the promises that are fine still run.
+        // the promises that are fine still run. The whole manifest is resolved and
+        // digest-checked here; only which entries THIS job executes is sharded.
         const { packages: available, rejected } = await readAvailablePackages(packagePath);
-        const selections = selectManifestEntries(available, manifest);
+        const selections = shardSelections(selectManifestEntries(available, manifest), shard);
         const results = await runManifestEntries(selections, mode);
         await announceRun(selections, results, rejected);
-        console.log(JSON.stringify({
-            schemaVersion: "continuity-run-output/v1",
-            mode,
-            sourceSha: results[0]?.sourceSha ?? null,
-            results,
-        }));
+        console.log(JSON.stringify(runOutputDocument(mode, manifest, shard, results)));
     }
     else {
         const packages = await readPackages(packagePath);
@@ -87,7 +186,18 @@ try {
             console.log(JSON.stringify({ valid: true, packageDigest: pkg.packageDigest }));
         }
         else if (command === "run-one-target") {
-            console.log(JSON.stringify(await runTarget(pkg)));
+            // The one command a coder runs on their own machine to ask "does this
+            // promise still hold?". It says the same four things the protected CI
+            // check says, and it exits non-zero when the answer is no: a local run
+            // that printed a refutation and exited 0 let an `&&` chain, a pre-commit
+            // hook, and an editor's task runner all report success over a broken
+            // behavior.
+            const result = await runTarget(pkg);
+            console.log(JSON.stringify(result));
+            await announceRun([{ kind: "package", promiseId: pkg.promise.id, package: pkg }], [result]);
+            const status = reportLocalTargetExit(result);
+            await drainOutput();
+            process.exit(status);
         }
         else if (command === "run-one") {
             if (!["good", "bad", "refactor"].includes(auxiliary ?? ""))
