@@ -133,6 +133,14 @@ async function createPackage(promiseId, label, options = {}) {
       refactor: command("refactor"),
     },
     ...(results ? { results } : {}),
+    // A failing check has to name who agreed the behavior and where to read it,
+    // so `seal` refuses a draft without this pair. It is optional on an already
+    // sealed package, which is what keeps packages sealed before it existed
+    // valid, and required of anything sealed from here on.
+    attribution: {
+      owner: "Owner Smoke",
+      promiseUrl: `https://attest.balladeer.ai/promises/${promiseId}`,
+    },
     materials: [
       {
         path: verifierPath,
@@ -198,6 +206,7 @@ try {
     promise: pkg.promise,
     verifier: pkg.verifier,
     results: pkg.results,
+    attribution: pkg.attribution,
     materials: pkg.materials.map(({ path, kind }) => ({ path, kind })),
   };
   assert.equal((await sealPackageDraft(draft, root)).packageDigest, pkg.packageDigest);
@@ -374,7 +383,10 @@ try {
   );
   assert.match(visible.stderr, /Approved observable outcome: Exactly one order is created/);
   const summary = await readFile(summaryPath, "utf8");
-  assert.match(summary, /\| prom_attestorsmoke \(Checkout creates one order\) \| target \| pass \|/);
+  assert.match(
+    summary,
+    /\| prom_attestorsmoke \(Checkout creates one order\) \| Owner Smoke \| https:\/\/attest\.balladeer\.ai\/promises\/prom_attestorsmoke \| target \| pass \|/,
+  );
   assert.match(summary, /Exactly one order is created/);
 
   // One re-sealed package must not blank the catalog. Every manifest entry
@@ -386,6 +398,7 @@ try {
       schemaVersion: second.schemaVersion,
       promise: second.promise,
       verifier: second.verifier,
+      attribution: second.attribution,
       materials: second.materials.map(({ path, kind }) => ({ path, kind })),
     },
     root,
@@ -560,9 +573,14 @@ try {
     { encoding: "utf8" },
   );
   assert.equal(emptyRun.status, 0, emptyRun.stderr);
+  // The run output says which frozen manifest and which shard produced it, so a
+  // document from another run or another slice can never be merged in as this
+  // one. An unsharded run is shard 0 of 1.
   assert.deepEqual(JSON.parse(emptyRun.stdout), {
     schemaVersion: "continuity-run-output/v1",
     mode: "target",
+    manifestDigest: sha256(canonicalize(emptyManifestBase)),
+    shard: { index: 0, count: 1 },
     sourceSha: null,
     results: [],
   });

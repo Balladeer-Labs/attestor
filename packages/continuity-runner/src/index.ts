@@ -100,11 +100,41 @@ export interface ResultSpec {
   /** JUnit only, relative to the verifier command's working directory. */
   file?: string;
 }
+/**
+ * The two facts a failing check needs that the approved meaning does not carry:
+ * who owns the meaning, by the name their team knows them by, and where the
+ * promise itself can be read.
+ *
+ * They live beside the meaning rather than inside it. `promise.semanticDigest`
+ * closes over every field of the meaning except its id and its owner id, so a
+ * name or a link written in there would change the digest the owner approved,
+ * and renaming a person would read as a semantic revision. Here they change the
+ * package digest instead, which is exactly right: the sealed package is the
+ * customer's own artifact, and re-sealing it is what activation re-checks.
+ *
+ * Neither is source material. The owner's display name is already handed to any
+ * connected agent by `get_promise_setup`, and the page is the customer's own
+ * Balladeer URL.
+ */
+export interface PromiseAttribution {
+  /** The name the promise's meaning owner is known by in the workspace. */
+  owner: string;
+  /** The promise's page in Balladeer: `http(s)`, and openable. */
+  promiseUrl: string;
+}
 export interface AcceptancePackage {
   schemaVersion: typeof RUNNER_SCHEMA;
   promise: PromiseMeaning;
   verifier: VerifierSpec;
   results?: ResultSpec;
+  /**
+   * Optional on read, required by `seal`. A package sealed before this member
+   * existed still validates and still runs: its failures name the owner by the
+   * membership id the meaning already carries and say plainly that the package
+   * was sealed without a page, which is the honest reading of one that has
+   * none.
+   */
+  attribution?: PromiseAttribution;
   materials: LockedMaterial[];
   packageDigest: string;
 }
@@ -113,6 +143,7 @@ export interface AcceptancePackageDraft {
   promise: PromiseMeaning;
   verifier: VerifierSpec;
   results?: ResultSpec;
+  attribution: PromiseAttribution;
   materials: Array<Omit<LockedMaterial, "digest">>;
 }
 
@@ -170,6 +201,19 @@ export const OUTCOME_REASONS = [
   "protocol_undeclared",
   "canceled_external",
   "custody_failed",
+  /**
+   * The verification job that owned this promise never reported. Verification
+   * is fanned out across shards, and a shard can die for reasons that have
+   * nothing to do with the customer's code: the runner was lost, the job hit
+   * its own wall clock, GitHub cancelled it, the artifact upload failed.
+   *
+   * It is minted by the merge, never by a verifier, and it says exactly one
+   * thing: nothing ran for this promise, so nothing is known about it. It is an
+   * infrastructure failure of Balladeer's own fan-out and can only ever produce
+   * Unknown. It is never a refutation, and it never reaches a promise outside
+   * the dead shard's own slice.
+   */
+  "shard_failed",
 ] as const;
 export type OutcomeReason = (typeof OUTCOME_REASONS)[number];
 
@@ -270,10 +314,11 @@ const packageKeys = [
   "promise",
   "verifier",
   "results",
+  "attribution",
   "materials",
   "packageDigest",
 ];
-const draftKeys = ["schemaVersion", "promise", "verifier", "results", "materials"];
+const draftKeys = ["schemaVersion", "promise", "verifier", "results", "attribution", "materials"];
 // Exactly what a published result may carry. Every entry is an enum, an
 // integer, an identifier, a timestamp, or a SHA-256 digest: no path, no
 // message, no example name, no free text.
@@ -353,6 +398,64 @@ function assertNotRetiredManifest(input: unknown): void {
     );
 }
 
+/**
+ * The four facts a verifier's failure has to name, carried as literals in the
+ * generated program itself.
+ *
+ * The reason they are literals rather than something the verifier looks up is
+ * that a customer runs their verifier three ways, and only one of them goes
+ * through this runner: bare `node verifier.mjs`, a test runner that spawns it
+ * as a child, and the protected CI run. A fact the runner prints is a fact the
+ * first two paths never say. Baked in, all three say the same four things, and
+ * the file a coder opens after a red already names the promise it broke.
+ */
+export interface ScaffoldPromiseFacts {
+  /** The one sentence the owner approved: the promise's observable outcome. */
+  claim: string;
+  /** The name the meaning owner is known by. */
+  owner: string;
+  /** The promise's page in Balladeer. */
+  promiseUrl: string;
+}
+
+/** What the scaffold writes when the four facts were not supplied. Every one of
+ * these is refused by `seal`, so a starter can never be sealed with them. */
+export const SCAFFOLD_FACT_PLACEHOLDERS: ScaffoldPromiseFacts = {
+  claim: "REPLACE_WITH_THE_OWNER_APPROVED_OBSERVABLE_OUTCOME",
+  owner: "REPLACE_WITH_THE_OWNER_NAME",
+  promiseUrl: "https://REPLACE_WITH_THE_BALLADEER_PROMISE_PAGE",
+};
+
+/**
+ * The generated starter verifier, with this promise's own four facts in it.
+ *
+ * Two things are deliberate. The facts are printed on stderr, not stdout, so a
+ * verifier declaring the native protocol still writes only its result document
+ * where the runner reads it. And they are printed only when the behavior is
+ * refuted: a passing run that shouted four facts at every invocation would be
+ * noise a customer edits out, and then the red says nothing.
+ */
+function scaffoldVerifierProgram(promiseId: string, facts: ScaffoldPromiseFacts): string {
+  const literal = (value: string): string => JSON.stringify(value);
+  return `import { writeFileSync } from "node:fs";
+const BALLADEER_PROMISE_ID = ${literal(promiseId)};
+const BALLADEER_PROMISE_CLAIM = ${literal(facts.claim)};
+const BALLADEER_PROMISE_OWNER = ${literal(facts.owner)};
+const BALLADEER_PROMISE_URL = ${literal(facts.promiseUrl)};
+const control = process.argv[2];
+// BALLADEER_STARTER_VERIFIER: replace this with a real customer-behavior verifier.
+const refuted = control === "bad" ? 1 : 0;
+if (refuted) {
+  process.stderr.write("Balladeer promise " + BALLADEER_PROMISE_ID + " is refuted by this run.\\n");
+  process.stderr.write("  Promise: " + BALLADEER_PROMISE_CLAIM + "\\n");
+  process.stderr.write("  Owner: " + BALLADEER_PROMISE_OWNER + "\\n");
+  process.stderr.write("  Promise page: " + BALLADEER_PROMISE_URL + "\\n");
+}
+writeFileSync(process.env.BALLADEER_RESULT_PATH, JSON.stringify({ schemaVersion: "continuity-verifier-result/v1", outcome: refuted ? "refuted" : "passed", examples: { total: 1, refuted, errored: 0 } }));
+process.exit(refuted);
+`;
+}
+
 // The scaffold's marker is deliberately not the only readiness guard. A
 // customer can remove a comment without having authored a verifier. Keep a
 // normalized structural fingerprint of the generated control program so that
@@ -361,17 +464,24 @@ function assertNotRetiredManifest(input: unknown): void {
 // The starter also demonstrates the native result protocol, because that is
 // the whole of it: write one small document at the path the runner exports,
 // with no Balladeer dependency, no import beyond node:fs, and no network.
-const scaffoldVerifierSource = `import { writeFileSync } from "node:fs";
-const control = process.argv[2];
-// BALLADEER_STARTER_VERIFIER: replace this with a real customer-behavior verifier.
-const refuted = control === "bad" ? 1 : 0;
-writeFileSync(process.env.BALLADEER_RESULT_PATH, JSON.stringify({ schemaVersion: "continuity-verifier-result/v1", outcome: refuted ? "refuted" : "passed", examples: { total: 1, refuted, errored: 0 } }));
-process.exit(refuted);
-`;
-const scaffoldVerifierStructure = scaffoldVerifierSource;
+const scaffoldVerifierStructure = scaffoldVerifierProgram(
+  "prom_structure",
+  SCAFFOLD_FACT_PLACEHOLDERS,
+);
+/**
+ * Two starters differ in four string literals and nothing else, because each
+ * one carries its own promise's facts. The fingerprint blanks exactly those
+ * four declarations before hashing, so it still recognizes every starter as a
+ * starter and still refuses one whose comments were stripped. It blanks the
+ * named declarations only, never string literals in general: a real verifier
+ * that happens to share the starter's shape must not be laundered into it.
+ */
+const factDeclaration =
+  /^const (BALLADEER_PROMISE_ID|BALLADEER_PROMISE_CLAIM|BALLADEER_PROMISE_OWNER|BALLADEER_PROMISE_URL) = (?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*');$/gm;
 const normalizedSource = (source: string): string =>
   source
     .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(factDeclaration, "const $1 = $$FACT$$;")
     .replace(/(^|\s)\/\/.*$/gm, "$1")
     .replace(/\s+/g, "");
 const scaffoldVerifierStructureDigest = sha256(normalizedSource(scaffoldVerifierStructure));
@@ -532,9 +642,39 @@ function validateResultSpec(
   return { protocol, file };
 }
 
+/**
+ * Validate the optional owner-and-page member.
+ *
+ * The URL is checked here rather than where it is printed, because it is
+ * printed into three channels a customer reads: a terminal line, a GitHub
+ * annotation, and a Markdown table. A scheme that is not `http` or `https`
+ * cannot be opened and has no business in any of them, and userinfo in a URL is
+ * a credential nobody should seal into a repository.
+ */
+function validateAttribution(input: unknown, label: string): PromiseAttribution {
+  keysAre(input, ["owner", "promiseUrl"], label);
+  const owner = stringField(input.owner, `${label}.owner`);
+  if (owner.length > 160) throw new Error(`${label}.owner must be at most 160 characters`);
+  const promiseUrl = stringField(input.promiseUrl, `${label}.promiseUrl`);
+  if (promiseUrl.length > 2_000)
+    throw new Error(`${label}.promiseUrl must be at most 2000 characters`);
+  let parsed: URL;
+  try {
+    parsed = new URL(promiseUrl);
+  } catch {
+    throw new Error(`${label}.promiseUrl must be an absolute http or https URL`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:")
+    throw new Error(`${label}.promiseUrl must be an absolute http or https URL`);
+  if (parsed.username !== "" || parsed.password !== "")
+    throw new Error(`${label}.promiseUrl must not carry a username or password`);
+  return { owner, promiseUrl };
+}
+
 export function validatePackage(input: unknown): AcceptancePackage {
   assertNotRetiredShape(input, "package");
-  keysAre(input, packageKeys, "package", ["results"]);
+  keysAre(input, packageKeys, "package", ["results", "attribution"]);
+  if (input.attribution !== undefined) validateAttribution(input.attribution, "attribution");
   if (input.schemaVersion !== RUNNER_SCHEMA)
     throw new Error(`package.schemaVersion must be ${RUNNER_SCHEMA}`);
   // `refactorExamples` is optional in the approved meaning: nothing asks a
@@ -762,7 +902,19 @@ export async function sealPackageDraft(
   executionRoot = process.cwd(),
 ): Promise<AcceptancePackage> {
   assertNotRetiredShape(input, "package draft");
-  keysAre(input, draftKeys, "package draft", ["results"]);
+  // `attribution` is listed as optional to `keysAre` so that the sentence below
+  // is the one a person reads. A bare "missing field: attribution" says what is
+  // absent and nothing about what to put there or why it matters.
+  keysAre(input, draftKeys, "package draft", ["results", "attribution"]);
+  // Required here, and optional on read. A package sealed before this member
+  // existed keeps running; every package sealed from now on can name its owner
+  // and its page in the line a coder reads when the check goes red, and the
+  // moment to find that out is at the desk, not in a failing job.
+  if (input.attribution === undefined)
+    throw new Error(
+      'package draft is missing attribution: add {"owner": "<the owner\'s name>", "promiseUrl": "<the promise page in Balladeer>"} so a failing check can name who to talk to and what was agreed',
+    );
+  const attribution = validateAttribution(input.attribution, "package draft attribution");
   if (!Array.isArray(input.materials)) throw new Error("package draft materials must be an array");
   if (!input.promise || typeof input.promise !== "object" || Array.isArray(input.promise))
     throw new Error("package draft promise must be an object");
@@ -824,23 +976,27 @@ export async function sealPackageDraft(
     });
   }
   await assertExactMaterialClosure(promiseId, materials, root);
-  assertNoStarterPlaceholders(input.promise, materials, "package draft");
+  assertNoStarterPlaceholders({ promise: input.promise, attribution }, materials, "package draft");
   const base = {
     schemaVersion: input.schemaVersion,
     promise: input.promise,
     verifier: input.verifier,
     ...(input.results === undefined ? {} : { results: input.results }),
+    attribution,
     materials,
   } as Omit<AcceptancePackage, "packageDigest">;
   return validatePackage({ ...base, packageDigest: packageDigest(base) });
 }
 
 function assertNoStarterPlaceholders(
-  promise: unknown,
+  // The approved meaning and the owner-and-page member together. Both come out
+  // of `scaffold` full of placeholders, and a package that named its owner
+  // "REPLACE_WITH_THE_OWNER_NAME" would put that string in a red check.
+  meaningAndAttribution: unknown,
   materials: LockedMaterial[],
   label: string,
 ): void {
-  const serialized = JSON.stringify(promise);
+  const serialized = JSON.stringify(meaningAndAttribution);
   if (serialized.includes("REPLACE_WITH_") || /replace with|replace me/i.test(serialized))
     throw new Error(`${label} still contains scaffold placeholders; replace the approved meaning`);
   for (const material of materials) {
@@ -875,7 +1031,14 @@ export async function assertPackageReady(
       throw new Error("package still contains the scaffold verifier");
     materials.push(material);
   }
-  assertNoStarterPlaceholders(pkg.promise, materials, "package");
+  assertNoStarterPlaceholders(
+    {
+      promise: pkg.promise,
+      ...(pkg.attribution === undefined ? {} : { attribution: pkg.attribution }),
+    },
+    materials,
+    "package",
+  );
   if (pkg.materials.some((material) => material.digest === sha256('{\n  "replaceMe": true\n}\n')))
     throw new Error("package still contains the scaffold fixture");
   return pkg;
@@ -1038,6 +1201,11 @@ export async function scaffoldPackage(
   outputPath: string,
   promiseId = "prom_example01",
   executionRoot = process.cwd(),
+  // The four facts, when the caller read them off the promise first. Without
+  // them the starter is written with placeholders, and `seal` refuses those, so
+  // the omission is caught at the desk rather than in a red check that could
+  // not say who to talk to.
+  facts: ScaffoldPromiseFacts = SCAFFOLD_FACT_PLACEHOLDERS,
 ): Promise<ScaffoldResult> {
   if (outputPath !== ".continuity")
     throw new Error("scaffold output must be the repository-local .continuity directory");
@@ -1133,14 +1301,15 @@ export async function scaffoldPackage(
       refactor: { executable: "node", args: [verifierPath, "refactor"] },
     },
     results: { protocol: "native" as const },
+    attribution: { owner: facts.owner, promiseUrl: facts.promiseUrl },
     materials: [
       { path: verifierPath, kind: "verifier" as const },
       { path: fixturePath, kind: "fixture" as const },
     ],
   };
-  const verifier = scaffoldVerifierSource;
+  const verifier = scaffoldVerifierProgram(promiseId, facts);
   const fixture = '{\n  "replaceMe": true\n}\n';
-  const readme = `# Continuity starter\n\nThis directory was generated locally for **${promiseId}**. It is an authoring starter, not a protected behavior.\n\n1. Replace every placeholder in drafts/${promiseId}.json.\n2. Replace promises/${promiseId}/verifier.mjs with a real verifier and update promises/${promiseId}/fixture.json. The starter verifier only demonstrates control wiring and the native result protocol: it writes {"schemaVersion":"continuity-verifier-result/v1","outcome":"passed"|"refuted"|"errored","examples":{"total":N,"refuted":N,"errored":N}} at the BALLADEER_RESULT_PATH the runner exports. A verifier that reports nothing there can never say a behavior was refuted, so its package can never qualify.\n3. From the repository root, seal it into ${outputPath}/packages/${promiseId}.json:\n\n   continuity-runner seal ${draftPath} ${outputPath}/packages/${promiseId}.json\n\nThe seal command refuses to overwrite an existing output. Run the local qualification controls before asking the Balladeer owner to activate the package. No source, fixture contents, or verifier output is sent to Balladeer; only closed digests and normalized outcomes are publishable.\n`;
+  const readme = `# Continuity starter\n\nThis directory was generated locally for **${promiseId}**. It is an authoring starter, not a protected behavior.\n\n1. Replace every placeholder in drafts/${promiseId}.json, including the \`attribution\` block: \`owner\` is the name the promise's meaning owner is known by, and \`promiseUrl\` is the promise's page in Balladeer. Both are read off the promise itself, and \`seal\` refuses a draft that still has the placeholders.\n2. Replace promises/${promiseId}/verifier.mjs with a real verifier and update promises/${promiseId}/fixture.json. The starter verifier only demonstrates control wiring and the native result protocol: it writes {"schemaVersion":"continuity-verifier-result/v1","outcome":"passed"|"refuted"|"errored","examples":{"total":N,"refuted":N,"errored":N}} at the BALLADEER_RESULT_PATH the runner exports. A verifier that reports nothing there can never say a behavior was refuted, so its package can never qualify.\n\n   Keep the four BALLADEER_PROMISE_ constants at the top and keep printing them when the behavior is refuted. They are what makes \`node ${verifierPath}\` on your own machine say the same four things the protected CI check says: which promise broke, the sentence its owner agreed to, who owns it, and where to read it.\n3. From the repository root, seal it into ${outputPath}/packages/${promiseId}.json:\n\n   continuity-runner seal ${draftPath} ${outputPath}/packages/${promiseId}.json\n\nThe seal command refuses to overwrite an existing output. Run the local qualification controls before asking the Balladeer owner to activate the package. No source, fixture contents, or verifier output is sent to Balladeer; only closed digests and normalized outcomes are publishable.\n`;
   await mkdir(pathResolve(root, promiseRoot), { recursive: true });
   await mkdir(pathResolve(root, `${outputPath}/drafts`), { recursive: true });
   await mkdir(pathResolve(root, `${outputPath}/packages`), { recursive: true });
@@ -1231,11 +1400,69 @@ export function selectManifestEntries(
   });
 }
 
+/** Where one shard sits in the fan-out that covers a frozen manifest. */
+export interface ShardCoordinates {
+  /** Zero-based position of this shard. */
+  index: number;
+  /** How many shards cover the manifest. `1` is the unsharded run. */
+  count: number;
+}
+
+export const UNSHARDED: ShardCoordinates = { index: 0, count: 1 };
+
+export function validateShardCoordinates(shard: ShardCoordinates): ShardCoordinates {
+  const { index, count } = shard;
+  if (!Number.isSafeInteger(count) || count < 1 || count > 4096)
+    throw new Error("shard count must be an integer between 1 and 4096");
+  if (!Number.isSafeInteger(index) || index < 0 || index >= count)
+    throw new Error("shard index must be an integer inside the shard count");
+  return { index, count };
+}
+
+/**
+ * The one rule that decides which shard owns which promise: round robin over
+ * the frozen manifest's own order.
+ *
+ * It is deterministic, so every shard, the merge, and the control plane agree
+ * on the partition without exchanging a word about it, and it needs nothing but
+ * the manifest each of them already holds. Round robin rather than contiguous
+ * blocks because manifest order is promise-id order, which correlates with
+ * directory layout and therefore with cost: a contiguous block hands one shard
+ * every slow verifier in a subsystem, and the fan-out is only as fast as its
+ * slowest shard.
+ *
+ * Every shard validates the WHOLE manifest digest before slicing, so sharding
+ * never widens what a run will accept. It only narrows what one job executes.
+ */
+export function shardOwnerOf(manifestIndex: number, shardCount: number): number {
+  return manifestIndex % shardCount;
+}
+
+/**
+ * The slice of a resolved manifest one shard runs. The input must be the full
+ * ordered selection for the frozen manifest, which is what `selectManifestEntries`
+ * returns; slicing anything else would silently change the partition.
+ */
+export function shardSelections(
+  selections: ManifestEntrySelection[],
+  shard: ShardCoordinates,
+): ManifestEntrySelection[] {
+  const { index, count } = validateShardCoordinates(shard);
+  if (count === 1) return [...selections];
+  return selections.filter((_entry, position) => shardOwnerOf(position, count) === index);
+}
+
 /**
  * Run the selected manifest entries serially. Target mode produces one result
  * per entry and exercise mode produces one per control, so the count the
  * control plane checks against the frozen manifest is the same whether a
  * package ran or was unavailable.
+ *
+ * Serial is deliberate inside one shard: customer verifiers may share a
+ * database, a queue, a port, or a fixture directory, and `docs/github-ci.md`
+ * refuses to run them concurrently in one checkout for exactly that reason.
+ * Concurrency is bought by adding shards, each with its own checkout, never by
+ * overlapping two verifiers in one.
  */
 export async function runManifestEntries(
   selections: ManifestEntrySelection[],
@@ -1268,6 +1495,198 @@ export async function runManifestEntries(
             ),
       );
   return results;
+}
+
+export const RUN_OUTPUT_SCHEMA = "continuity-run-output/v1" as const;
+
+/**
+ * What one manifest run writes to stdout, and what the merge reads back.
+ *
+ * `manifestDigest` and `shard` are what make a shard's output self-describing:
+ * the merge can prove every part it is joining ran the same frozen manifest,
+ * and can name the shards that never reported without being told how many to
+ * expect by the workflow that may itself have failed.
+ */
+export interface RunOutputDocument {
+  schemaVersion: typeof RUN_OUTPUT_SCHEMA;
+  mode: ManifestRunMode;
+  manifestDigest: string;
+  shard: ShardCoordinates;
+  sourceSha: string | null;
+  results: RunResult[];
+}
+
+export function runOutputDocument(
+  mode: ManifestRunMode,
+  manifest: ExecutionManifest,
+  shard: ShardCoordinates,
+  results: RunResult[],
+): RunOutputDocument {
+  return {
+    schemaVersion: RUN_OUTPUT_SCHEMA,
+    mode,
+    manifestDigest: manifest.manifestDigest,
+    shard: validateShardCoordinates(shard),
+    sourceSha: results[0]?.sourceSha ?? null,
+    results,
+  };
+}
+
+export function validateRunOutputDocument(input: unknown): RunOutputDocument {
+  keysAre(
+    input,
+    ["schemaVersion", "mode", "manifestDigest", "shard", "sourceSha", "results"],
+    "run output",
+  );
+  if (input.schemaVersion !== RUN_OUTPUT_SCHEMA)
+    throw new Error("run output schemaVersion is invalid");
+  if (input.mode !== "target" && input.mode !== "exercise")
+    throw new Error("run output mode is invalid");
+  digestField(input.manifestDigest, "run output manifestDigest");
+  keysAre(input.shard, ["index", "count"], "run output shard");
+  const shard = validateShardCoordinates(input.shard as unknown as ShardCoordinates);
+  if (input.sourceSha !== null && !isGitSha(input.sourceSha))
+    throw new Error("run output sourceSha must be null or an exact 40-hex commit SHA");
+  if (!Array.isArray(input.results)) throw new Error("run output results must be an array");
+  const results = input.results.map(validateResult);
+  return { ...(input as object), shard, results } as RunOutputDocument;
+}
+
+/** What the merge did, so the job log can say it and a test can assert it. */
+export interface ShardMergeReport {
+  manifestDigest: string;
+  /** Shards the merge could prove ran, in ascending order. */
+  reportedShards: number[];
+  /** Shards whose output never arrived, in ascending order. */
+  missingShards: number[];
+  /** Promises the merge had to answer for itself, in manifest order. */
+  unreportedPromiseIds: string[];
+  /** One result per manifest promise, in manifest order. */
+  results: RunResult[];
+}
+
+/**
+ * Join every shard's closed results into the one document the publisher posts.
+ *
+ * Robert's ruling, and the reason this exists: a dead shard costs Unknown for
+ * ITS OWN promises and for nothing else. Before sharding, one job carried the
+ * whole catalog and one failure took every promise in the repository to
+ * Unknown; the fan-out would repeat that at a larger scale if a missing shard
+ * simply shrank the published set, because the control plane's cardinality
+ * check is exact and would refuse the whole publication.
+ *
+ * So the merge answers for the promises nobody answered for. It mints one
+ * closed `errored` result per unreported promise, carrying the reason
+ * `shard_failed`, which says an infrastructure failure of Balladeer's own
+ * verification fan-out left the behavior unmeasured. It is never `refuted`: no
+ * verifier ran, so nothing was refuted, and a caught regression is the one
+ * thing this must never be mistaken for.
+ *
+ * Cardinality therefore stays exact. The publisher still sends exactly one
+ * result per frozen manifest promise, and the control plane's check is
+ * untouched.
+ */
+export function mergeShardOutputs(
+  manifestInput: ExecutionManifest,
+  documents: readonly unknown[],
+  sourceSha: string,
+  now: Date = new Date(),
+): ShardMergeReport {
+  const manifest = validateExecutionManifest(manifestInput);
+  if (!isGitSha(sourceSha)) throw new Error("sourceSha must be an exact 40-hex commit SHA");
+  const parsed = documents.map(validateRunOutputDocument);
+  const byPromise = new Map<string, RunResult>();
+  const reported = new Set<number>();
+  let shardCount: number | undefined;
+  const ownerOf = new Map<string, number>();
+  manifest.promises.forEach((entry, position) => ownerOf.set(entry.id, position));
+  for (const document of parsed) {
+    if (document.mode !== "target") throw new Error("shard output is not a target run");
+    if (document.manifestDigest !== manifest.manifestDigest)
+      throw new Error("shard output was produced against a different frozen manifest");
+    if (shardCount === undefined) shardCount = document.shard.count;
+    else if (shardCount !== document.shard.count)
+      throw new Error("shard outputs disagree about how many shards cover the manifest");
+    if (reported.has(document.shard.index))
+      throw new Error("two outputs claim the same shard index");
+    reported.add(document.shard.index);
+    for (const result of document.results) {
+      const position = ownerOf.get(result.promiseId);
+      if (position === undefined)
+        throw new Error("shard output carries a promise that is not in the frozen manifest");
+      // A shard may only answer for its own slice. Without this a shard that
+      // ignored its coordinates could overwrite a healthy shard's verdict.
+      if (shardOwnerOf(position, document.shard.count) !== document.shard.index)
+        throw new Error("shard output carries a promise from another shard's slice");
+      if (result.sourceSha !== sourceSha)
+        throw new Error("shard output was produced against a different commit");
+      if (byPromise.has(result.promiseId))
+        throw new Error("two shard outputs answer for the same promise");
+      byPromise.set(result.promiseId, result);
+    }
+  }
+  const count = shardCount ?? 1;
+  const unreportedPromiseIds: string[] = [];
+  const results = manifest.promises.map((entry) => {
+    const answered = byPromise.get(entry.id);
+    if (answered !== undefined) return answered;
+    unreportedPromiseIds.push(entry.id);
+    return closedResult(
+      entry.id,
+      entry.packageDigest,
+      "target",
+      now,
+      sourceSha,
+      "errored",
+      "shard_failed",
+      null,
+      // Custody is a claim about materials that were actually checked. Nothing
+      // was checked here, so this result may not assert a broken seal either:
+      // `custody-invalid` would accuse the customer of changing locked
+      // material, which is a different and much louder finding than "our job
+      // died". The control plane records this reason as custody unverified.
+      "local",
+      "exit-code-only",
+    );
+  });
+  const missingShards = Array.from({ length: count }, (_value, index) => index).filter(
+    (index) => !reported.has(index),
+  );
+  return {
+    manifestDigest: manifest.manifestDigest,
+    reportedShards: [...reported].sort((left, right) => left - right),
+    missingShards,
+    unreportedPromiseIds,
+    results,
+  };
+}
+
+/**
+ * Say what the merge had to answer for. A person reading a red check must be
+ * able to tell "our job died" from "your behavior broke" without opening a
+ * result document.
+ */
+export async function announceMerge(report: ShardMergeReport): Promise<void> {
+  if (report.missingShards.length === 0 && report.unreportedPromiseIds.length === 0) {
+    humanLine(
+      `all ${report.reportedShards.length} verification shard(s) reported; ${report.results.length} result(s) merged in promise order.`,
+    );
+    return;
+  }
+  const sentence =
+    `${report.missingShards.length} verification shard(s) did not report (${report.missingShards.join(", ")}), ` +
+    `so ${report.unreportedPromiseIds.length} promise(s) read Unknown for this run with reason shard_failed. ` +
+    "This is an infrastructure failure of the verification fan-out, not a refuted test, and it leaves every promise that did report untouched.";
+  humanLine(sentence);
+  annotate("warning", sentence);
+  for (const promiseId of report.unreportedPromiseIds)
+    humanLine(`${loggable(promiseId, 80)}: no verification job reported. Reason: shard_failed.`);
+  await appendJobSummary(
+    report.unreportedPromiseIds.map(
+      (promiseId) =>
+        `| ${loggable(promiseId, 240).replace(/\|/g, "\\|")} | target | errored (shard_failed) | No verification job reported for this promise. |`,
+    ),
+  );
 }
 
 function digestStream(value: string): string {
@@ -1496,14 +1915,75 @@ function annotationLevel(outcome: RunOutcome): "notice" | "warning" | "error" {
   return "warning";
 }
 
+/**
+ * What a local target run leaves behind as its exit status.
+ *
+ * A local run of a promise's own verifier used to exit 0 whatever it found, so
+ * a coder's `&&` chain carried on past a refutation and their editor showed a
+ * green tick over a broken behavior. A local red has to be red.
+ *
+ * The statuses are separated rather than collapsed into one, for the same
+ * reason the outcomes are: a script that treats "the behavior broke" and "the
+ * check could not run" identically has thrown away the distinction this whole
+ * protocol exists to keep. Anything non-zero is a red; which red it is says
+ * what to do about it.
+ *
+ * This is the LOCAL contract only. The CI command keeps exiting 0 on a
+ * refutation on purpose: its job is to publish the evidence, and a job step
+ * that failed before the publish step would turn a caught regression into an
+ * outage of the thing that reports caught regressions.
+ */
+export const LOCAL_EXIT_STATUS: Readonly<Record<RunOutcome, number>> = {
+  pass: 0,
+  /** The behavior no longer holds. */
+  refuted: 1,
+  /** Nothing ran, or nothing finished: the behavior is unmeasured, not broken. */
+  errored: 3,
+  timed_out: 3,
+  canceled: 3,
+  /** Digest-locked material changed, so no result from this run can be trusted. */
+  "custody-invalid": 4,
+};
+
+/** What a local target run exits with, and the sentence that explains it. */
+export function localTargetExit(result: RunResult): { status: number; explanation: string } {
+  const status = LOCAL_EXIT_STATUS[result.outcome];
+  if (status === 0)
+    return { status, explanation: "the behavior holds; exiting 0 because the target run passed" };
+  if (result.outcome === "refuted")
+    return {
+      status,
+      explanation:
+        "exiting 1 because the target run refuted this promise: the behavior a named person agreed to no longer holds",
+    };
+  if (result.outcome === "custody-invalid")
+    return {
+      status,
+      explanation:
+        "exiting 4 because digest-locked material changed, so nothing this run produced can be trusted; this is not a statement about the behavior",
+    };
+  return {
+    status,
+    explanation:
+      "exiting 3 because the check could not run to a verdict, so the behavior is unmeasured rather than broken",
+  };
+}
+
+/** Say why the local run is exiting the way it is, and hand back the status. */
+export function reportLocalTargetExit(result: RunResult): number {
+  const { status, explanation } = localTargetExit(result);
+  humanLine(explanation);
+  return status;
+}
+
 async function appendJobSummary(rows: string[]): Promise<void> {
   const path = process.env.GITHUB_STEP_SUMMARY;
   if (!path || rows.length === 0) return;
   const table = [
     "### Balladeer continuity attestor",
     "",
-    "| Promise | Control | Outcome | Detail |",
-    "| --- | --- | --- | --- |",
+    "| Promise | Owner | Promise page | Control | Outcome | Detail |",
+    "| --- | --- | --- | --- | --- | --- |",
     ...rows,
     "",
   ].join("\n");
@@ -1515,10 +1995,45 @@ async function appendJobSummary(rows: string[]): Promise<void> {
 }
 
 /**
+ * Who owns the promise, said so a person can act on it.
+ *
+ * The sealed package carries a name when it was sealed by a runner that asks
+ * for one. When it does not, the membership id in the approved meaning is what
+ * exists, and printing it is better than printing nothing: it is the string the
+ * promise page resolves to a person. Either way the field is always there, so
+ * "no owner" is never a thing this line can quietly say.
+ */
+function announcedOwner(pkg: AcceptancePackage | undefined): string {
+  if (pkg === undefined) return "not available: no sealed package for this promise";
+  if (pkg.attribution !== undefined) return loggable(pkg.attribution.owner, 160);
+  return `${loggable(pkg.promise.ownerId, 80)} (membership id; re-seal this package to name the owner)`;
+}
+
+/**
+ * Where the promise itself can be read.
+ *
+ * The runner is offline and holds no origin of its own, so the only honest
+ * source is the sealed package. A package sealed before this member existed
+ * says so rather than guessing at a hostname, because a link that 404s is worse
+ * than a sentence that names the repair.
+ */
+function announcedPage(pkg: AcceptancePackage | undefined): string {
+  if (pkg?.attribution !== undefined) return loggable(pkg.attribution.promiseUrl, 2_000);
+  return "not sealed into this package; re-seal it with the promise page to link it here";
+}
+
+/**
  * Say what happened, in the customer's own job log, for every promise the run
  * covered. This is explanation only: it reads finished results and writes to
  * the human channel, the GitHub annotation stream, and the job summary. It
  * never changes a result and never adds a field to what is published.
+ *
+ * Every line names four things: which promise, the sentence its owner approved,
+ * who owns it, and where to read it. That is what turns a red check into
+ * something a coder can act on without opening a browser to find out what broke
+ * or asking around for who agreed to it. The same four go into all three
+ * channels, because a person reading the annotation and a person reading the
+ * job summary must not be told different amounts.
  */
 export async function announceRun(
   selections: ManifestEntrySelection[],
@@ -1554,9 +2069,13 @@ export async function announceRun(
     // the log is never left to guess whether the behavior broke or the check
     // could not run.
     const outcomeReason = result.outcomeReason === null ? "" : `Reason: ${result.outcomeReason}.`;
+    const owner = announcedOwner(pkg);
+    const page = announcedPage(pkg);
     const detail = [outcomeReason, context].filter((part) => part !== "").join(" ");
     const named = `${result.outcome}${result.outcomeReason === null ? "" : ` (${result.outcomeReason})`}`;
-    const sentence = `${subject}: ${result.control} control outcome ${named}.${detail === "" ? "" : ` ${detail}`}`;
+    // The four facts, in one sentence, in the order a person needs them: which
+    // promise, what was agreed, who agreed it, where to read it.
+    const sentence = `${subject}: ${result.control} control outcome ${named}.${detail === "" ? "" : ` ${detail}`} Owner: ${owner}. Promise page: ${page}`;
     humanLine(sentence);
     // Only a refutation is a caught regression, and a custody failure is the
     // one other outcome that earns a red: the material changed, so nothing this
@@ -1564,7 +2083,9 @@ export async function announceRun(
     // warning, because it never blames the customer's code for breaking a
     // behavior nobody managed to check.
     annotate(annotationLevel(result.outcome), sentence);
-    rows.push(`| ${cell(subject, 240)} | ${result.control} | ${named} | ${cell(detail, 240)} |`);
+    rows.push(
+      `| ${cell(subject, 240)} | ${cell(owner, 160)} | ${cell(page, 2_000)} | ${result.control} | ${named} | ${cell(detail, 240)} |`,
+    );
   }
   await appendJobSummary(rows);
 }
