@@ -159,9 +159,15 @@ try {
     };
     await walk(auxiliary);
     files.sort();
-    const documents = await Promise.all(
-      files.map(async (path) => JSON.parse(await readFile(path, "utf8")) as unknown),
-    );
+    // The artifacts are read one at a time, in sorted path order. The public
+    // release gate reads "verifier controls and packages execute serially" off
+    // this source as a plain text scan, so no concurrent promise combinator may
+    // appear in this file or in `index.ts`. Nothing is owed to concurrency
+    // here: the merge reads a handful of small closed result documents, and the
+    // sequential read also makes a failure deterministic, because the first
+    // unreadable artifact in path order is the one that is reported.
+    const documents: unknown[] = [];
+    for (const path of files) documents.push(JSON.parse(await readFile(path, "utf8")) as unknown);
     const report = mergeShardOutputs(manifest, documents, sourceSha);
     await announceMerge(report);
     const merged = {
