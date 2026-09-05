@@ -453,6 +453,37 @@ try {
   escaped.packageDigest = packageDigest(escaped);
   assert.throws(() => validatePackage(escaped), /must be inside/);
 
+  // Two populations of meanings now reach this runner. Nothing asks a person to
+  // predict a substantial refactor any more, so a meaning approved today omits
+  // `refactorExamples` entirely, while one approved while the field was
+  // required still carries it and still digests to the same bytes. Both are
+  // packages a customer can qualify. What stays required is the refactor
+  // CONTROL in the verifier block, which is a different field: it is the run
+  // that proves the verifier survives a behavior-preserving change.
+  const meaningOnly = ({ id: _id, ownerId: _owner, semanticDigest: _digest, ...rest }) => rest;
+  const omitted = structuredClone(pkg);
+  delete omitted.promise.refactorExamples;
+  omitted.promise.semanticDigest = sha256(canonicalize(meaningOnly(omitted.promise)));
+  omitted.packageDigest = packageDigest(omitted);
+  assert.equal("refactorExamples" in validatePackage(omitted).promise, false);
+  assert.equal("refactorExamples" in validatePackage(pkg).promise, true);
+
+  // `[]` is a second spelling of the same absence and would digest differently,
+  // so an empty list is refused rather than read as an omission.
+  const emptied = structuredClone(pkg);
+  emptied.promise.refactorExamples = [];
+  emptied.promise.semanticDigest = sha256(canonicalize(meaningOnly(emptied.promise)));
+  emptied.packageDigest = packageDigest(emptied);
+  assert.throws(() => validatePackage(emptied), /must contain between 1 and 12 examples/);
+
+  const withoutRefactorControl = structuredClone(omitted);
+  delete withoutRefactorControl.verifier.refactor;
+  withoutRefactorControl.packageDigest = packageDigest(withoutRefactorControl);
+  assert.throws(
+    () => validatePackage(withoutRefactorControl),
+    /verifier is missing field: refactor/,
+  );
+
   // A package written against the retired noun is refused by name rather than
   // with a generic unknown-field error, so whoever reads the job log is told
   // what happened. The retired word is assembled from fragments here for the
