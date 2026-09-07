@@ -85,3 +85,26 @@ not a sandbox against a deliberately malicious customer verifier: such a verifie
 inside the customer's own GitHub job and may use whatever network access GitHub and the
 customer permit. Balladeer's authored workflow sends data only to
 `https://attest.balladeer.ai` and GitHub's OIDC and artifact services.
+
+## Optional same-job replay self-checks
+
+`verify_replay_boundaries` is a default-off boolean, gated again to default-branch
+pushes in both publishers. It enables only fixed requests after successful
+publication: one identical target repeat; for a qualified receipt, one identical
+repeat followed by one copy with only the good-control result digest changed.
+All calls use the fixed origin, existing OIDC token and network deadlines. There
+are no extra permissions, caller hooks or source checkouts. Authentication refusal
+is not accepted as replay proof. An unexpected status or error fails the job.
+The ordinary request has already been applied, so a self-check failure does not
+roll back that evidence. This is bounded protocol verification, not retry logic.
+
+A second default-off boolean, `verify_pr_qualification_boundary`, extends only the
+two qualification job event gates to opt-in pull requests. It keeps source reading
+without OIDC and publication without checkout. Its fixed publication path expects
+HTTP 400 `invalid_request` and skips normal receipt handling; any other response
+fails. The existing intake still authenticates GitHub, validates schema and exact
+identity, checks enrollment and refuses non-authoritative qualification. A generic
+refusal cannot identify which check refused it, so operator corroboration is
+mandatory. No input grants authority or changes the request body. Fork restrictions
+and registration refusals may prevent reaching this probe; those outcomes do not
+count as qualification intake proof.

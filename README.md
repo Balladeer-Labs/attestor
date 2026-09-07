@@ -210,3 +210,30 @@ independent review or cross-repository canaries in
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+### Optional publication replay self-checks
+
+The reusable workflow accepts `verify_replay_boundaries: true` for a controlled
+proof run. It defaults to false and only takes effect on a push to the supplied
+default branch. After successful publication, the publisher repeats the same
+target request and requires a conflict. For qualified receipts it requires an
+identical repeat to be reported as replayed, then requires a copy with one changed
+result digest to conflict. A failed expectation fails the publisher job; already
+published evidence is not rolled back. Nonqualifying receipts skip this check.
+
+This switch only enables fixed, bounded requests to the existing service origin.
+It cannot select an executable, checkout, endpoint or OIDC audience. The same job
+uses its existing token; no token or request body is printed. Use a reviewed,
+registered immutable release and obtain authorization for the controlled requests
+before enabling it. Disable the input after the proof run.
+
+`verify_pr_qualification_boundary: true` is a separate default-off proof switch.
+On pull-request events only, it allows the existing qualification controls to
+produce closed receipts and the existing isolated publisher to submit them. The
+publisher requires the current bounded HTTP 400 `invalid_request` refusal and
+skips normal acceptance handling. Unexpected acceptance fails the proof. This
+response class is generic: an operator must corroborate the intended default-branch
+restriction and absence of a new stored receipt or activation. It is not standalone
+proof of why a request was refused. A run without qualification metadata produces
+no receipt and establishes no qualification-refusal proof. Ordinary PR target
+verification remains advisory; this switch does not change service authority.
