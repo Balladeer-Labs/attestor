@@ -23,6 +23,7 @@ const expected = new Set([
   "release/continuity-runner/cli.js",
   "release/continuity-runner/index.js",
   "scripts/check-release.mjs",
+  "scripts/check-publisher-replay.mjs",
   "scripts/check-runner-reproducible.mjs",
   "scripts/smoke-runner.mjs",
   "packages/continuity-runner/package.json",

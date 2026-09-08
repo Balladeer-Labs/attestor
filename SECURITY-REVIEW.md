@@ -158,3 +158,31 @@ Neither draft is merged, tagged, production-registered, or approved for customer
 merely because this checklist exists. The release gates above and the private
 control-plane's own deployment gates remain independent.
 
+
+## Pending release: optional same-job replay self-checks
+
+Trust claim affected: a spent target challenge cannot be applied again; an exact
+qualified receipt is idempotent while changed content under its identity conflicts.
+The default-off boolean enables fixed requests only after successful default-branch
+publication, in the existing token-bearing publisher with no checkout. No runner
+or generated executable changes. `scripts/check-publisher-replay.mjs` extracts the
+actual shell and uses a synthetic local curl replacement to check success,
+default-off, undecided controls, unexpected acceptance and wrong refusal classes.
+These are offline command-shape tests, not hosted server proof.
+
+Before registration/customer use, qualify the exact public commit through release
+integrity and review its diff. In an authorized isolated cross-repository run,
+observe one original target application plus duplicate conflict, and one qualified
+receipt application plus unchanged replay and changed-content conflict. Verify no
+extra lifecycle event or posture change from duplicates, remove the opt-in and
+re-run ordinary publication. PR-context qualification refusal is enabled separately as described below.
+
+PR qualification probe: independently opt in using the second boolean. Default
+behavior remains push-only qualification. Re-test a valid enrolled pull request
+with runner-generated closed receipt and exact run/attempt identity, then confirm
+intended intake refusal in bounded operator evidence and no new receipt, active
+binding or posture mutation. Current HTTP 400 `invalid_request` alone is insufficient;
+a schema or identity refusal must not count. Offline extracted-shell tests cover
+the expected refusal, default-off, unexpected acceptance and wrong refusal class.
+After the controlled run remove the opt-in and qualification metadata, then confirm
+ordinary pull requests again skip qualification jobs.

@@ -18,7 +18,7 @@
     "check:runner": "node scripts/check-runner-reproducible.mjs",
     "test:runner": "node scripts/smoke-runner.mjs",
     "typecheck": "pnpm --filter @balladeer/continuity-runner typecheck",
-    "check-release": "node scripts/check-release.mjs && node scripts/check-runner-reproducible.mjs && node scripts/smoke-runner.mjs"
+    "check-release": "node scripts/check-release.mjs && node scripts/check-runner-reproducible.mjs && node scripts/smoke-runner.mjs && node scripts/check-publisher-replay.mjs"
   },
   "devDependencies": {
     "@types/node": "24.3.0",

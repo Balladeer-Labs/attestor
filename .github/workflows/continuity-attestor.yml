@@ -15,6 +15,18 @@ on:
         required: true
         type: string
 
+      verify_replay_boundaries:
+        description: Run bounded same-job replay self-checks after successful default-branch publication.
+        required: false
+        type: boolean
+        default: false
+
+      verify_pr_qualification_boundary:
+        description: Submit closed PR qualification receipts only to check intake refusal; operator corroboration is required.
+        required: false
+        type: boolean
+        default: false
+
 permissions: {}
 
 # Do not turn these into caller inputs, vars, or secrets. A caller-selectable
@@ -324,6 +336,7 @@ jobs:
           name: continuity-closed-result
       - name: Publish closed target results
         env:
+          VERIFY_REPLAY_BOUNDARIES: ${{ inputs.verify_replay_boundaries && github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch) }}
           WORKSPACE_LOCATOR: ${{ inputs.workspace_locator }}
           TARGET_ID: ${{ needs.register.outputs.target_id }}
           MANIFEST_DIGEST: ${{ needs.register.outputs.manifest_digest }}
@@ -339,9 +352,18 @@ jobs:
           jq --arg workspaceLocator "$WORKSPACE_LOCATOR" --arg targetId "$TARGET_ID" --arg manifestDigest "$MANIFEST_DIGEST" --arg runId "$GH_RUN_ID" --arg challenge "$CHALLENGE" '{schemaVersion:"continuity-ci/v1",mode:"target",workspaceLocator:$workspaceLocator,targetId:$targetId,manifestDigest:$manifestDigest,runId:$runId,challenge:$challenge,results:.results,shadowApplicability:(reduce .results[] as $r ({}; .[$r.promiseId] = null))}' continuity-results.json > publish.json
           curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/results" \
             -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @publish.json
+          # Begin target replay self-check
+          if [[ "$VERIFY_REPLAY_BOUNDARIES" == 'true' ]]; then
+            replay_response="$RUNNER_TEMP/balladeer-target-replay-response.json"
+            replay_status="$(curl --connect-timeout 10 --max-time 30 --silent --show-error --output "$replay_response" --write-out '%{http_code}' -X POST 'https://attest.balladeer.ai/api/ci/results' -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @publish.json)"
+            test "$replay_status" = '409'
+            jq -e '.error == "conflict"' "$replay_response" >/dev/null
+            echo 'target same-job replay: conflict; no request body or token emitted.'
+          fi
+          # End target replay self-check
 
   qualify-controls:
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch)
+    if: (github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch)) || (inputs.verify_pr_qualification_boundary && github.event_name == 'pull_request')
     needs: register
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -416,8 +438,8 @@ jobs:
           retention-days: 1
 
   qualify-publish:
-    if:
-      github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch)
+    if: >-
+      ((github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch)) || (inputs.verify_pr_qualification_boundary && github.event_name == 'pull_request'))
       && needs.qualify-controls.outputs.has_receipts == 'true'
     needs: qualify-controls
     runs-on: ubuntu-24.04
@@ -431,6 +453,9 @@ jobs:
           name: continuity-qualification-receipts
           path: qualification-requests
       - name: Publish closed qualification receipts
+        env:
+          VERIFY_PR_QUALIFICATION_BOUNDARY: ${{ inputs.verify_pr_qualification_boundary && github.event_name == 'pull_request' }}
+          VERIFY_REPLAY_BOUNDARIES: ${{ inputs.verify_replay_boundaries && github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default_branch) }}
         run: |
           set -euo pipefail
           token="$(curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BALLADEER_OIDC_AUDIENCE" | jq -er .value)"
@@ -438,8 +463,36 @@ jobs:
           receipts=(qualification-requests/*.json)
           test "${#receipts[@]}" -gt 0
           for receipt in "${receipts[@]}"; do
+            # Begin PR qualification refusal self-check
+            if [[ "$VERIFY_PR_QUALIFICATION_BOUNDARY" == 'true' ]]; then
+              refusal_response="$RUNNER_TEMP/balladeer-pr-qualification-response.json"
+              refusal_status="$(curl --connect-timeout 10 --max-time 30 --silent --show-error --output "$refusal_response" --write-out '%{http_code}' -X POST 'https://attest.balladeer.ai/api/ci/qualification-receipts' -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @"$receipt")"
+              test "$refusal_status" = '400'
+              jq -e '.error == "invalid_request"' "$refusal_response" >/dev/null
+              echo 'PR qualification refused; operator must corroborate intended posture boundary and no stored receipt or activation.'
+              continue
+            fi
+            # End PR qualification refusal self-check
             curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error -X POST "$BALLADEER_CONTROL_PLANE_URL/api/ci/qualification-receipts" \
               -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @"$receipt"
+            # Begin qualification replay self-check
+            if [[ "$VERIFY_REPLAY_BOUNDARIES" == 'true' ]]; then
+              if jq -e '.controls.good.outcome == "pass" and .controls.bad.outcome == "refuted" and .controls.refactor.outcome == "pass" and .controls.tamper.outcome == "detected"' "$receipt" >/dev/null; then
+                replay_response="$RUNNER_TEMP/balladeer-qualification-replay-response.json"
+                replay_status="$(curl --connect-timeout 10 --max-time 30 --silent --show-error --output "$replay_response" --write-out '%{http_code}' -X POST 'https://attest.balladeer.ai/api/ci/qualification-receipts' -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @"$receipt")"
+                test "$replay_status" = '200'
+                jq -e '.status == "replayed"' "$replay_response" >/dev/null
+                altered_receipt="$RUNNER_TEMP/balladeer-altered-qualification-request.json"
+                jq '.controls.good.resultDigest = (if .controls.good.resultDigest == ("sha256:" + ("0" * 64)) then ("sha256:" + ("1" * 64)) else ("sha256:" + ("0" * 64)) end)' "$receipt" > "$altered_receipt"
+                altered_status="$(curl --connect-timeout 10 --max-time 30 --silent --show-error --output "$replay_response" --write-out '%{http_code}' -X POST 'https://attest.balladeer.ai/api/ci/qualification-receipts' -H 'content-type: application/json' -H "authorization: Bearer $token" --data-binary @"$altered_receipt")"
+                test "$altered_status" = '409'
+                jq -e '.error == "conflict"' "$replay_response" >/dev/null
+                echo 'receipt same-job replay: unchanged replayed; changed contents conflict.'
+              else
+                echo 'receipt replay not exercised: controls did not qualify.'
+              fi
+            fi
+            # End qualification replay self-check
           done
 
   # The gate runs after publication, never instead of it. A control that could
