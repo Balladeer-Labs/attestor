@@ -96,6 +96,8 @@ export const RESULT_SIGNALS = [
 /** The largest example count a published result may carry. */
 const exampleCountLimit = 1_000_000;
 const meaningKeys = [
+    "oneSentenceOutcome",
+    "saidWords",
     "id",
     "semanticDigest",
     "title",
@@ -270,6 +272,15 @@ function stringField(value, label) {
         throw new Error(`${label} must be a non-empty string`);
     return value;
 }
+// Optional wording stays byte-for-byte inside the approved meaning. Validate
+// without trimming, defaulting, or stripping it before digest verification.
+function optionalWording(value, key, label, max) {
+    if (!Object.hasOwn(value, key))
+        return;
+    const text = stringField(value[key], `${label}.${key}`);
+    if (text.length > max)
+        throw new Error(`${label}.${key} must be at most ${max} characters`);
+}
 function stringArray(value, label) {
     if (!Array.isArray(value) || value.some((v) => typeof v !== "string"))
         throw new Error(`${label} must be an array of strings`);
@@ -305,7 +316,10 @@ function validateExamples(value, label) {
     if (!Array.isArray(value) || value.length < 1 || value.length > 12)
         throw new Error(`${label} must contain between 1 and 12 examples`);
     for (const [index, example] of value.entries()) {
-        keysAre(example, ["label", "setup", "expectedOutcome"], `${label}[${index}]`);
+        keysAre(example, ["label", "setup", "expectedOutcome", "saidWords"], `${label}[${index}]`, [
+            "saidWords",
+        ]);
+        optionalWording(example, "saidWords", `${label}[${index}]`, 2000);
         stringField(example.label, `${label}[${index}].label`);
         stringField(example.setup, `${label}[${index}].setup`);
         stringField(example.expectedOutcome, `${label}[${index}].expectedOutcome`);
@@ -423,7 +437,13 @@ export function validatePackage(input) {
     // person for one any more, and a meaning recorded while it was required
     // still carries it. This widens what a package may omit and narrows nothing.
     // The refactor CONTROL below is a separate field and is unchanged.
-    keysAre(input.promise, meaningKeys, "promise", ["refactorExamples"]);
+    keysAre(input.promise, meaningKeys, "promise", [
+        "refactorExamples",
+        "oneSentenceOutcome",
+        "saidWords",
+    ]);
+    optionalWording(input.promise, "oneSentenceOutcome", "promise", 160);
+    optionalWording(input.promise, "saidWords", "promise", 2000);
     const promiseId = stringField(input.promise.id, "promise.id");
     for (const key of ["title", "beneficiary", "trigger", "observableOutcome", "ownerId"])
         stringField(input.promise[key], `promise.${key}`);

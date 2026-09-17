@@ -29,6 +29,7 @@ export type Control = (typeof CONTROLS)[number];
 export type RunMode = (typeof RUN_MODES)[number];
 
 export interface BehavioralExample {
+  saidWords?: string;
   label: string;
   setup: string;
   expectedOutcome: string;
@@ -41,6 +42,8 @@ export interface PromiseScope {
 }
 
 export interface PromiseMeaning {
+  oneSentenceOutcome?: string;
+  saidWords?: string;
   id: string;
   semanticDigest: string;
   title: string;
@@ -293,6 +296,8 @@ export interface ExecutionManifest {
 }
 
 const meaningKeys = [
+  "oneSentenceOutcome",
+  "saidWords",
   "id",
   "semanticDigest",
   "title",
@@ -510,6 +515,18 @@ function stringField(value: unknown, label: string): string {
     throw new Error(`${label} must be a non-empty string`);
   return value;
 }
+// Optional wording stays byte-for-byte inside the approved meaning. Validate
+// without trimming, defaulting, or stripping it before digest verification.
+function optionalWording(
+  value: Record<string, unknown>,
+  key: string,
+  label: string,
+  max: number,
+): void {
+  if (!Object.hasOwn(value, key)) return;
+  const text = stringField(value[key], `${label}.${key}`);
+  if (text.length > max) throw new Error(`${label}.${key} must be at most ${max} characters`);
+}
 function stringArray(value: unknown, label: string): string[] {
   if (!Array.isArray(value) || value.some((v) => typeof v !== "string"))
     throw new Error(`${label} must be an array of strings`);
@@ -549,7 +566,10 @@ function validateExamples(value: unknown, label: string): BehavioralExample[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > 12)
     throw new Error(`${label} must contain between 1 and 12 examples`);
   for (const [index, example] of value.entries()) {
-    keysAre(example, ["label", "setup", "expectedOutcome"], `${label}[${index}]`);
+    keysAre(example, ["label", "setup", "expectedOutcome", "saidWords"], `${label}[${index}]`, [
+      "saidWords",
+    ]);
+    optionalWording(example, "saidWords", `${label}[${index}]`, 2000);
     stringField(example.label, `${label}[${index}].label`);
     stringField(example.setup, `${label}[${index}].setup`);
     stringField(example.expectedOutcome, `${label}[${index}].expectedOutcome`);
@@ -681,7 +701,13 @@ export function validatePackage(input: unknown): AcceptancePackage {
   // person for one any more, and a meaning recorded while it was required
   // still carries it. This widens what a package may omit and narrows nothing.
   // The refactor CONTROL below is a separate field and is unchanged.
-  keysAre(input.promise, meaningKeys, "promise", ["refactorExamples"]);
+  keysAre(input.promise, meaningKeys, "promise", [
+    "refactorExamples",
+    "oneSentenceOutcome",
+    "saidWords",
+  ]);
+  optionalWording(input.promise, "oneSentenceOutcome", "promise", 160);
+  optionalWording(input.promise, "saidWords", "promise", 2000);
   const promiseId = stringField(input.promise.id, "promise.id");
   for (const key of ["title", "beneficiary", "trigger", "observableOutcome", "ownerId"])
     stringField(input.promise[key], `promise.${key}`);

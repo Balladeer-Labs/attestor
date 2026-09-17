@@ -212,6 +212,84 @@ try {
   assert.equal((await sealPackageDraft(draft, root)).packageDigest, pkg.packageDigest);
   await assertPackageReady(pkg, root);
 
+  // Optional approved wording is part of meaning, not display-only metadata.
+  // Seal and parse must retain every byte and bind it into both digests.
+  const optionalWording = [
+    { path: ["oneSentenceOutcome"], limit: 160, text: "Each submitted cart creates exactly one order." },
+    { path: ["saidWords"], limit: 2000, text: "  Please create one order for each cart.  " },
+    ...["passingExamples", "failingExamples", "refactorExamples"].map((key) => ({
+      path: [key, 0, "saidWords"], limit: 2000, text: "Keep the order even when checkout internals change.",
+    })),
+  ];
+  const setWording = (meaning, path, value) => {
+    let target = meaning;
+    for (const key of path.slice(0, -1)) target = target[key];
+    target[path.at(-1)] = value;
+  };
+  const refreshSemanticDigest = (promise) => {
+    const { id: _id, ownerId: _owner, semanticDigest: _digest, ...meaning } = promise;
+    promise.semanticDigest = sha256(canonicalize(meaning));
+  };
+  for (const { path, limit, text } of optionalWording) {
+    const enriched = structuredClone(draft);
+    setWording(enriched.promise, path, text);
+    refreshSemanticDigest(enriched.promise);
+    const sealed = await sealPackageDraft(enriched, root);
+    assert.deepEqual(sealed.promise, enriched.promise, `${path.join(".")} survives sealing`);
+    assert.deepEqual(validatePackage(JSON.parse(JSON.stringify(sealed))), sealed);
+    assert.notEqual(sealed.promise.semanticDigest, pkg.promise.semanticDigest);
+    assert.notEqual(sealed.packageDigest, pkg.packageDigest);
+
+    const boundary = structuredClone(enriched);
+    setWording(boundary.promise, path, "x".repeat(limit));
+    refreshSemanticDigest(boundary.promise);
+    assert.deepEqual((await sealPackageDraft(boundary, root)).promise, boundary.promise);
+    for (const malformed of [null, "", " \n\t", 12, false, [], {}, "x".repeat(limit + 1)]) {
+      const invalid = structuredClone(enriched);
+      setWording(invalid.promise, path, malformed);
+      refreshSemanticDigest(invalid.promise);
+      await assert.rejects(sealPackageDraft(invalid, root), /must be (a non-empty string|at most)/);
+    }
+    const undefinedField = structuredClone(sealed);
+    setWording(undefinedField.promise, path, undefined);
+    assert.throws(() => validatePackage(undefinedField), /must be a non-empty string/);
+
+    const staleMeaning = structuredClone(sealed);
+    setWording(staleMeaning.promise, path, "Changed approved wording");
+    staleMeaning.packageDigest = packageDigest(staleMeaning);
+    assert.throws(() => validatePackage(staleMeaning), /semanticDigest does not match/);
+    const stalePackage = structuredClone(sealed);
+    setWording(stalePackage.promise, path, "Changed approved wording");
+    refreshSemanticDigest(stalePackage.promise);
+    assert.throws(() => validatePackage(stalePackage), /packageDigest does not match/);
+
+    const stripped = structuredClone(sealed);
+    let parent = stripped.promise;
+    for (const key of path.slice(0, -1)) parent = parent[key];
+    delete parent[path.at(-1)];
+    stripped.packageDigest = packageDigest(stripped);
+    assert.throws(() => validatePackage(stripped), /semanticDigest does not match/);
+  }
+  const completeWording = structuredClone(draft);
+  for (const { path, text } of optionalWording) setWording(completeWording.promise, path, text);
+  refreshSemanticDigest(completeWording.promise);
+  assert.deepEqual((await sealPackageDraft(completeWording, root)).promise, completeWording.promise);
+  for (const path of [
+    ["unknownWording"],
+    ...["passingExamples", "failingExamples", "refactorExamples"].map((key) => [key, 0, "unknownWording"]),
+  ]) {
+    const unknown = structuredClone(completeWording);
+    setWording(unknown.promise, path, "Unexpected field");
+    refreshSemanticDigest(unknown.promise);
+    await assert.rejects(sealPackageDraft(unknown, root), /has unknown field: unknownWording/);
+  }
+  const noRefactorWording = structuredClone(completeWording);
+  delete noRefactorWording.promise.refactorExamples;
+  refreshSemanticDigest(noRefactorWording.promise);
+  assert.deepEqual((await sealPackageDraft(noRefactorWording, root)).promise, noRefactorWording.promise);
+  // Optional additions do not normalize or change old packages.
+  assert.equal((await sealPackageDraft(draft, root)).packageDigest, pkg.packageDigest);
+
   // The published receipt carries exactly the bounded control pair for every
   // control, including tamper. A control that leaks an extra field (a
   // promise id, a path, raw output) widens what leaves customer CI, so the
