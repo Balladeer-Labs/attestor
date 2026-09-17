@@ -78,6 +78,24 @@ Controls and promises execute serially by default because customer verifiers may
 databases, queues, ports, or other mutable fixtures. Individual verifier processes remain
 time-bounded, and the surrounding GitHub jobs have explicit wall-clock limits.
 
+## Keeping the agreed meaning intact
+
+The promise in a sealed package may include `oneSentenceOutcome` and `saidWords`,
+and each passing, failing or refactor example may include its own `saidWords`.
+These are optional fields: existing packages that omit them remain valid. When
+present, they are part of the agreed meaning and its digest. Preserve their exact
+text. Removing a field, trimming a quotation or replacing it with a paraphrase
+changes the meaning; it is not a repair for a runner that does not recognize it.
+The headline is limited to 160 characters and each quotation to 2,000. Unknown
+fields and malformed values are still refused.
+
+A runner upgrade does not change the human-approved revision. Qualification
+metadata, however, binds the selected attestor release. After an enrollment upgrade,
+request fresh qualification metadata and use the new immutable workflow pin before
+qualifying. Existing verifier code and fixtures can be reused. If sealing previously
+failed, seal the complete agreed meaning with the corrected runner. Never change
+an agreed semantic digest to fit an older runner.
+
 ## How a verifier reports its verdict
 
 Exit status alone cannot separate a refusal from a crash. Node, Ruby and Python all exit 1

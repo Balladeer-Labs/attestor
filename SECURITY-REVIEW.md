@@ -186,3 +186,21 @@ a schema or identity refusal must not count. Offline extracted-shell tests cover
 the expected refusal, default-off, unexpected acceptance and wrong refusal class.
 After the controlled run remove the opt-in and qualification metadata, then confirm
 ordinary pull requests again skip qualification jobs.
+
+## Optional agreed wording compatibility
+
+Trust claim affected: the runner accepts the full agreed meaning without dropping
+owner wording or changing its digest. The package admits only the optional
+`oneSentenceOutcome` (160 characters) and `saidWords` (2,000 characters), with
+`saidWords` also optional on each example. Missing keys stay absent; present text
+is preserved exactly. The package and semantic digests continue covering it.
+
+Re-test the old absent-field form, every new field independently and together,
+Unicode and maximum lengths, malformed/empty/oversized values, unknown keys,
+removed or changed wording under an old semantic digest, and a stale package
+digest after semantic changes. Smoke fixtures must be synthetic and public-safe.
+Reproduce the generated runner and run the same controls from an independent
+synthetic repository at the exact release SHA before production registration.
+The workflow, executable-selection guards, permissions, fixed destinations and
+closed result/receipt wire formats are unchanged. No new customer content leaves
+the runner. These deterministic checks do not claim customer qualification.
