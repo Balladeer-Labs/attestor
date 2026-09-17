@@ -273,7 +273,9 @@ try {
   const completeWording = structuredClone(draft);
   for (const { path, text } of optionalWording) setWording(completeWording.promise, path, text);
   refreshSemanticDigest(completeWording.promise);
-  assert.deepEqual((await sealPackageDraft(completeWording, root)).promise, completeWording.promise);
+  const completePackage = await sealPackageDraft(completeWording, root);
+  assert.deepEqual(completePackage.promise, completeWording.promise);
+  assert.equal((await runTarget(completePackage, root, sourceSha)).outcome, "pass");
   for (const path of [
     ["unknownWording"],
     ...["passingExamples", "failingExamples", "refactorExamples"].map((key) => [key, 0, "unknownWording"]),
@@ -308,7 +310,7 @@ try {
     GITHUB_SHA: sourceSha,
   });
   const qualification = await buildQualificationRequest(
-    pkg,
+    completePackage,
     {
       schemaVersion: "continuity-qualification-meta/v1",
       workspaceLocator: "3f1d9c2a-5b64-4a7e-9c31-8d2f6a0b4e57",
@@ -319,6 +321,8 @@ try {
     },
     root,
   );
+  assert.equal(qualification.semanticDigest, completePackage.promise.semanticDigest);
+  assert.equal(qualification.packageDigest, completePackage.packageDigest);
   // The receipt's own key set is the contract the control plane's intake parses
   // strictly. A key the runner sends and the server refuses answers 400 on the
   // customer's default branch, and no server-side fixture written by hand can
