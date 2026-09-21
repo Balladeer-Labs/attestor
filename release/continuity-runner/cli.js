@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { announceMerge, announceRun, assertPackageReady, buildQualificationRequest, createOffboardingExport, mergeShardOutputs, qualificationSummary, readAvailablePackages, readPackages, reportLocalTargetExit, runOutputDocument, scaffoldPackage, runAllPackages, runManifestEntries, runOne, runTarget, runTamperControls, sealPackageDraft, selectManifestEntries, shardSelections, validateExecutionManifest, } from "./index.js";
+import { announceMerge, announceRun, assertPackageReady, buildQualificationRequest, createOffboardingExport, mergeShardOutputs, qualificationSummary, qualificationAlreadyCompleted, readAvailablePackages, readPackages, reportLocalTargetExit, runOutputDocument, scaffoldPackage, runAllPackages, runManifestEntries, runOne, runTarget, runTamperControls, sealPackageDraft, selectManifestEntries, shardSelections, validateExecutionManifest, } from "./index.js";
 // Standard output and standard error are pipes in GitHub Actions, so writes to
 // them complete asynchronously. Exiting immediately after a write can drop it.
 // Every exit path drains both channels first: the closed result on stdout and
@@ -48,7 +48,7 @@ const wholeNumber = (name, fallback) => {
 };
 const [command, packagePath, auxiliary, outputPath] = positional;
 if (!command || !packagePath) {
-    console.error("usage: continuity-runner <scaffold|seal|validate-package|qualify|qualification-request|run-one|run-one-target|run-all|run-manifest-target|merge-shard-results|exercise|offboarding> <package-or-draft-path> [control|manifest|metadata|promise-id] [output|promise-facts.json] [--shard N --shards K]\n" +
+    console.error("usage: continuity-runner <scaffold|seal|validate-package|qualify|qualification-plan|qualification-request|run-one|run-one-target|run-all|run-manifest-target|merge-shard-results|exercise|offboarding> <package-or-draft-path> [control|manifest|metadata|promise-id] [output|promise-facts.json] [--shard N --shards K]\n" +
         '  scaffold .continuity <promise-id> [promise-facts.json]  promise-facts.json is {"claim":..., "owner":..., "promiseUrl":...}, read off the promise\n' +
         "  run-one-target exits 0 when the behavior holds, 1 when it is refuted, 3 when the check could not run, 4 when custody is invalid\n" +
         "  run-manifest-target --shard N --shards K runs one shard of the fan-out; the merge joins them\n" +
@@ -91,6 +91,22 @@ try {
             sealed: true,
             packageDigest: sealed.packageDigest,
             output: auxiliary,
+        }));
+        await drainOutput();
+        process.exit(0);
+    }
+    if (command === "qualification-plan") {
+        if (!auxiliary || !outputPath)
+            throw new Error("qualification-plan requires metadata and completion advice JSON");
+        const packages = await readPackages(packagePath);
+        if (packages.length !== 1)
+            throw new Error("qualification-plan requires exactly one sealed package");
+        const metadata = JSON.parse(await readFile(auxiliary, "utf8"));
+        const advice = JSON.parse(await readFile(outputPath, "utf8"));
+        const completed = await qualificationAlreadyCompleted(packages[0], metadata, advice);
+        console.log(JSON.stringify({
+            status: completed ? "already_qualified" : "required",
+            promiseId: packages[0].promise.id,
         }));
         await drainOutput();
         process.exit(0);

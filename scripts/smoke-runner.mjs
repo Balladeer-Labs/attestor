@@ -9,6 +9,7 @@ import {
   canonicalize,
   packageDigest,
   qualificationSummary,
+  qualificationAlreadyCompleted,
   RESULT_SIGNALS,
   runAll,
   runTamperControl,
@@ -215,10 +216,16 @@ try {
   // Optional approved wording is part of meaning, not display-only metadata.
   // Seal and parse must retain every byte and bind it into both digests.
   const optionalWording = [
-    { path: ["oneSentenceOutcome"], limit: 160, text: "Each submitted cart creates exactly one order." },
+    {
+      path: ["oneSentenceOutcome"],
+      limit: 160,
+      text: "Each submitted cart creates exactly one order.",
+    },
     { path: ["saidWords"], limit: 2000, text: "  Please create one order for each cart.  " },
     ...["passingExamples", "failingExamples", "refactorExamples"].map((key) => ({
-      path: [key, 0, "saidWords"], limit: 2000, text: "Keep the order even when checkout internals change.",
+      path: [key, 0, "saidWords"],
+      limit: 2000,
+      text: "Keep the order even when checkout internals change.",
     })),
   ];
   const setWording = (meaning, path, value) => {
@@ -278,7 +285,11 @@ try {
   assert.equal((await runTarget(completePackage, root, sourceSha)).outcome, "pass");
   for (const path of [
     ["unknownWording"],
-    ...["passingExamples", "failingExamples", "refactorExamples"].map((key) => [key, 0, "unknownWording"]),
+    ...["passingExamples", "failingExamples", "refactorExamples"].map((key) => [
+      key,
+      0,
+      "unknownWording",
+    ]),
   ]) {
     const unknown = structuredClone(completeWording);
     setWording(unknown.promise, path, "Unexpected field");
@@ -288,7 +299,10 @@ try {
   const noRefactorWording = structuredClone(completeWording);
   delete noRefactorWording.promise.refactorExamples;
   refreshSemanticDigest(noRefactorWording.promise);
-  assert.deepEqual((await sealPackageDraft(noRefactorWording, root)).promise, noRefactorWording.promise);
+  assert.deepEqual(
+    (await sealPackageDraft(noRefactorWording, root)).promise,
+    noRefactorWording.promise,
+  );
   // Optional additions do not normalize or change old packages.
   assert.equal((await sealPackageDraft(draft, root)).packageDigest, pkg.packageDigest);
 
@@ -323,6 +337,169 @@ try {
   );
   assert.equal(qualification.semanticDigest, completePackage.promise.semanticDigest);
   assert.equal(qualification.packageDigest, completePackage.packageDigest);
+  const completionMetadata = {
+    schemaVersion: "continuity-qualification-meta/v1",
+    workspaceLocator: qualification.workspaceLocator,
+    receiptId: qualification.receiptId,
+    revisionId: qualification.revisionId,
+    bindingId: qualification.bindingId,
+    workflowDigest: qualification.workflowDigest,
+  };
+  const completion = {
+    workspaceLocator: qualification.workspaceLocator,
+    receiptId: qualification.receiptId,
+    revisionId: qualification.revisionId,
+    bindingId: qualification.bindingId,
+    workflowDigest: qualification.workflowDigest,
+    promiseId: completePackage.promise.id,
+    packageDigest: completePackage.packageDigest,
+  };
+  assert.equal(
+    await qualificationAlreadyCompleted(completePackage, completionMetadata, [], root),
+    false,
+  );
+  assert.equal(
+    await qualificationAlreadyCompleted(completePackage, completionMetadata, [completion], root),
+    true,
+  );
+  for (const key of [
+    "workspaceLocator",
+    "receiptId",
+    "revisionId",
+    "bindingId",
+    "workflowDigest",
+    "promiseId",
+    "packageDigest",
+  ]) {
+    const changed = {
+      ...completion,
+      [key]: key.endsWith("Digest")
+        ? sha256("changed")
+        : key === "workspaceLocator" || key === "receiptId"
+          ? "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+          : key === "revisionId"
+            ? "rev_changed001"
+            : key === "bindingId"
+              ? "bind_changed001"
+              : "prom_changed001",
+    };
+    assert.equal(
+      await qualificationAlreadyCompleted(completePackage, completionMetadata, [changed], root),
+      false,
+      key,
+    );
+  }
+  for (const invalid of [
+    null,
+    {},
+    [{ ...completion, executable: "untrusted" }],
+    [completion, {}],
+  ]) {
+    assert.equal(
+      await qualificationAlreadyCompleted(completePackage, completionMetadata, invalid, root),
+      false,
+    );
+  }
+  const lockedFile = join(root, completePackage.materials.find((m) => m.kind === "fixture").path);
+  const lockedBytes = await readFile(lockedFile);
+  await writeFile(lockedFile, "changed");
+  assert.equal(
+    await qualificationAlreadyCompleted(completePackage, completionMetadata, [completion], root),
+    false,
+  );
+  await writeFile(lockedFile, lockedBytes);
+  assert.equal(
+    await qualificationAlreadyCompleted(completePackage, completionMetadata, [completion], root),
+    true,
+  );
+
+  // Execute the exact qualification job shell with the prebuilt runner. No network,
+  // invented job logic or customer source is involved in this synthetic probe.
+  const workflowText = await readFile(
+    new URL("../.github/workflows/continuity-attestor.yml", import.meta.url),
+    "utf8",
+  );
+  const adviceShell = workflowText.slice(
+    workflowText.indexOf("          completed_b64="),
+    workflowText.indexOf("          # How the control plane wants"),
+  );
+  for (const [size, expected] of [
+    [100, [completion]],
+    [899999, []],
+  ]) {
+    const output = join(root, `registration-advice-${size}`);
+    const result = spawnSync(
+      "bash",
+      ["-c", `manifest_b64=$(printf '%*s' "$ADVICE_MANIFEST_SIZE" ''); ${adviceShell}`],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ADVICE_MANIFEST_SIZE: String(size),
+          response: JSON.stringify({ completedQualifications: [completion] }),
+          GITHUB_OUTPUT: output,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const encoded = (await readFile(output, "utf8")).trim().split("=").slice(1).join("=");
+    assert.deepEqual(JSON.parse(Buffer.from(encoded, "base64").toString()), expected);
+  }
+  const qualifyJob = workflowText.slice(workflowText.indexOf("      - id: qualify\n"));
+  const shellText = qualifyJob
+    .slice(
+      qualifyJob.indexOf("        run: |\n") + "        run: |\n".length,
+      qualifyJob.indexOf("      - name: Upload closed qualification receipts only"),
+    )
+    .split("\n")
+    .map((line) => (line.startsWith("          ") ? line.slice(10) : line))
+    .join("\n");
+  const shellRoot = await mkdtemp(join(tmpdir(), "attestor-qualification-job-"));
+  try {
+    for (const material of completePackage.materials) {
+      const destination = join(shellRoot, material.path);
+      await mkdir(destination.slice(0, destination.lastIndexOf("/")), { recursive: true });
+      await writeFile(destination, await readFile(join(root, material.path)));
+    }
+    await mkdir(join(shellRoot, ".continuity/packages"), { recursive: true });
+    await mkdir(join(shellRoot, ".continuity/qualification"), { recursive: true });
+    await writeFile(
+      join(shellRoot, `.continuity/packages/${completePackage.promise.id}.json`),
+      JSON.stringify(completePackage),
+    );
+    await writeFile(
+      join(shellRoot, `.continuity/qualification/${completePackage.promise.id}.json`),
+      JSON.stringify(completionMetadata),
+    );
+    for (const [label, advice, expected] of [
+      ["first", [], true],
+      ["next-push", [completion], false],
+      ["retry", [completion], false],
+    ]) {
+      const temp = join(shellRoot, label);
+      await mkdir(temp);
+      const output = join(temp, "outputs");
+      const envFile = join(temp, "env");
+      const executed = spawnSync("bash", ["-c", shellText], {
+        cwd: shellRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          RUNNER_TEMP: temp,
+          GITHUB_OUTPUT: output,
+          GITHUB_ENV: envFile,
+          BALLADEER_TRUSTED_RUNNER: new URL("../release/continuity-runner/cli.js", import.meta.url)
+            .pathname,
+          COMPLETED_QUALIFICATIONS_B64: Buffer.from(JSON.stringify(advice)).toString("base64"),
+        },
+      });
+      assert.equal(executed.status, 0, executed.stderr);
+      assert.match(await readFile(output, "utf8"), new RegExp(`has_receipts=${expected}`));
+      if (!expected) assert.match(executed.stdout, /Qualification already completed/);
+    }
+  } finally {
+    await rm(shellRoot, { recursive: true, force: true });
+  }
   // The receipt's own key set is the contract the control plane's intake parses
   // strictly. A key the runner sends and the server refuses answers 400 on the
   // customer's default branch, and no server-side fixture written by hand can
@@ -454,7 +631,10 @@ try {
   }
   assert.equal(visibleOutput.results[0].stdoutDigest, sha256(verifierStdout));
   assert.equal(visibleOutput.results[0].stderrDigest, sha256(verifierStderr));
-  assert.match(visible.stderr, /\[balladeer\] prom_attestorsmoke target stdout: raw customer output/);
+  assert.match(
+    visible.stderr,
+    /\[balladeer\] prom_attestorsmoke target stdout: raw customer output/,
+  );
   assert.match(
     visible.stderr,
     /\[balladeer\] prom_attestorsmoke target stderr: customer diagnostic line/,
@@ -474,7 +654,10 @@ try {
   // One re-sealed package must not blank the catalog. Every manifest entry
   // still owes exactly one result, the re-sealed promise alone is
   // custody-invalid, and the healthy promise still runs.
-  await writeFile(join(root, ".continuity/promises/prom_attestorother/fixture.json"), '{"case":"Renewal v2"}\n');
+  await writeFile(
+    join(root, ".continuity/promises/prom_attestorother/fixture.json"),
+    '{"case":"Renewal v2"}\n',
+  );
   const resealed = await sealPackageDraft(
     {
       schemaVersion: second.schemaVersion,
@@ -522,7 +705,10 @@ try {
   );
   assert.match(missing.stderr, /No sealed package for this promise is in the package directory/);
   assert.match(missing.stderr, /not a valid sealed package: .*not-a-sealed-package\.json/);
-  assert.match(missing.stderr, /::error::prom_attestorother: target control outcome custody-invalid/);
+  assert.match(
+    missing.stderr,
+    /::error::prom_attestorother: target control outcome custody-invalid/,
+  );
 
   const promiseRoot = join(root, ".continuity/promises/prom_attestorsmoke");
   const undeclaredPath = join(promiseRoot, "undeclared-helper.mjs");
@@ -816,10 +1002,7 @@ try {
   await assertScenario(
     "Claims a pass while exiting non-zero",
     {
-      source: nativeWriter(
-        nativeDocument("passed", { total: 3, refuted: 0, errored: 0 }),
-        1,
-      ),
+      source: nativeWriter(nativeDocument("passed", { total: 3, refuted: 0, errored: 0 }), 1),
     },
     "errored",
     "result_disagrees_exit",
@@ -1051,7 +1234,7 @@ try {
   const crashOnBad = await createPackage(scenarioId(), "Crashes on the known-bad control", {
     source:
       'import { writeFileSync } from "node:fs";\n' +
-      'const mode = process.argv[2];\n' +
+      "const mode = process.argv[2];\n" +
       'if (mode === "bad") await import("./missing-dependency.mjs");\n' +
       `writeFileSync(process.env.BALLADEER_RESULT_PATH, ${JSON.stringify(
         nativeDocument("passed", { total: 1, refuted: 0, errored: 0 }),
@@ -1132,10 +1315,7 @@ try {
     () => validateResult({ ...nativeRefuted, outcomeReason: "verifier_was_sad" }),
     /outcomeReason is invalid/,
   );
-  assert.throws(
-    () => validateResult({ ...crashed, signal: "SIGMADEUP" }),
-    /signal is invalid/,
-  );
+  assert.throws(() => validateResult({ ...crashed, signal: "SIGMADEUP" }), /signal is invalid/);
   assert.throws(
     () => validateResult({ ...crashed, outcomeReason: null }),
     /outcomeReason must be present/,

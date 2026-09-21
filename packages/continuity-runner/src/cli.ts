@@ -9,6 +9,7 @@ import {
   createOffboardingExport,
   mergeShardOutputs,
   qualificationSummary,
+  qualificationAlreadyCompleted,
   readAvailablePackages,
   readPackages,
   reportLocalTargetExit,
@@ -75,7 +76,7 @@ const wholeNumber = (name: string, fallback: number): number => {
 const [command, packagePath, auxiliary, outputPath] = positional;
 if (!command || !packagePath) {
   console.error(
-    "usage: continuity-runner <scaffold|seal|validate-package|qualify|qualification-request|run-one|run-one-target|run-all|run-manifest-target|merge-shard-results|exercise|offboarding> <package-or-draft-path> [control|manifest|metadata|promise-id] [output|promise-facts.json] [--shard N --shards K]\n" +
+    "usage: continuity-runner <scaffold|seal|validate-package|qualify|qualification-plan|qualification-request|run-one|run-one-target|run-all|run-manifest-target|merge-shard-results|exercise|offboarding> <package-or-draft-path> [control|manifest|metadata|promise-id] [output|promise-facts.json] [--shard N --shards K]\n" +
       '  scaffold .continuity <promise-id> [promise-facts.json]  promise-facts.json is {"claim":..., "owner":..., "promiseUrl":...}, read off the promise\n' +
       "  run-one-target exits 0 when the behavior holds, 1 when it is refuted, 3 when the check could not run, 4 when custody is invalid\n" +
       "  run-manifest-target --shard N --shards K runs one shard of the fan-out; the merge joins them\n" +
@@ -121,6 +122,24 @@ try {
         sealed: true,
         packageDigest: sealed.packageDigest,
         output: auxiliary,
+      }),
+    );
+    await drainOutput();
+    process.exit(0);
+  }
+  if (command === "qualification-plan") {
+    if (!auxiliary || !outputPath)
+      throw new Error("qualification-plan requires metadata and completion advice JSON");
+    const packages = await readPackages(packagePath);
+    if (packages.length !== 1)
+      throw new Error("qualification-plan requires exactly one sealed package");
+    const metadata = JSON.parse(await readFile(auxiliary, "utf8")) as unknown;
+    const advice = JSON.parse(await readFile(outputPath, "utf8")) as unknown;
+    const completed = await qualificationAlreadyCompleted(packages[0]!, metadata, advice);
+    console.log(
+      JSON.stringify({
+        status: completed ? "already_qualified" : "required",
+        promiseId: packages[0]!.promise.id,
       }),
     );
     await drainOutput();

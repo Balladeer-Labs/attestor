@@ -42,6 +42,7 @@ jobs:
     permissions:
       id-token: write
     outputs:
+      completed_qualifications_b64: ${{ steps.register.outputs.completed_qualifications_b64 }}
       target_id: ${{ steps.register.outputs.target_id }}
       manifest_digest: ${{ steps.register.outputs.manifest_digest }}
       challenge: ${{ steps.register.outputs.challenge }}
@@ -103,6 +104,10 @@ jobs:
           manifest_b64="$(jq -c .manifest <<<"$response" | base64 | tr -d '\n')"
           test -n "$manifest_b64" && test "${#manifest_b64}" -le 900000
           printf 'manifest_b64=%s\n' "$manifest_b64" >> "$GITHUB_OUTPUT"
+          # Bounded setup advice only. Older servers safely return an empty list.
+          completed_b64="$(jq -c '.completedQualifications // []' <<<"$response" | base64 | tr -d '\n')"
+          if [[ "${#completed_b64}" -gt 100000 ]] || (( ${#manifest_b64} + ${#completed_b64} > 900000 )); then completed_b64='W10='; fi
+          printf 'completed_qualifications_b64=%s\n' "$completed_b64" >> "$GITHUB_OUTPUT"
           # How the control plane wants this run's verification fanned out. It is
           # advice, not authority: the exact set of promises that must be verified
           # is the frozen manifest above, and the control plane's cardinality check
@@ -409,6 +414,7 @@ jobs:
       - id: qualify
         name: Create closed qualification receipts
         env:
+          COMPLETED_QUALIFICATIONS_B64: ${{ needs.register.outputs.completed_qualifications_b64 }}
           BALLADEER_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -421,12 +427,21 @@ jobs:
             echo "No pending qualification metadata; continuing without a qualification artifact."
             exit 0
           fi
-          echo "has_receipts=true" >> "$GITHUB_OUTPUT"
+          completed_path="$RUNNER_TEMP/continuity-completed-qualifications.json"
+          printf '%s' "${COMPLETED_QUALIFICATIONS_B64:-W10=}" | base64 --decode > "$completed_path"
+          has_receipts=false
           for metadata in "${metadata_files[@]}"; do
             promise_id="$(basename "$metadata" .json)"
             package=".continuity/packages/${promise_id}.json"
+            plan="$(node "$BALLADEER_TRUSTED_RUNNER" qualification-plan "$package" "$metadata" "$completed_path")"
+            if jq -e '.status == "already_qualified"' <<<"$plan" >/dev/null; then
+              echo 'Qualification already completed for this exact package. Ordinary verification still runs; removing consumed metadata is optional cleanup.'
+              continue
+            fi
             node "$BALLADEER_TRUSTED_RUNNER" qualification-request "$package" "$metadata" "$request_dir/${promise_id}.json"
+            has_receipts=true
           done
+          echo "has_receipts=$has_receipts" >> "$GITHUB_OUTPUT"
           echo "QUALIFICATION_REQUEST_DIR=$request_dir" >> "$GITHUB_ENV"
       - name: Upload closed qualification receipts only
         if: steps.qualify.outputs.has_receipts == 'true'
