@@ -1107,6 +1107,63 @@ export function validateQualificationMetadata(input: unknown): QualificationMeta
   };
 }
 
+/** Completion advice can suppress only one-time setup controls, never ordinary verification.
+ * Missing or malformed advice falls back to the existing qualification path. The package,
+ * original packet and material custody must still match exactly; no command is executed here.
+ */
+export async function qualificationAlreadyCompleted(
+  pkgInput: AcceptancePackage,
+  metadataInput: unknown,
+  completedInput: unknown,
+  executionRoot = process.cwd(),
+): Promise<boolean> {
+  const pkg = validatePackage(pkgInput);
+  const metadata = validateQualificationMetadata(metadataInput);
+  if (!Array.isArray(completedInput) || completedInput.length > 1000) return false;
+  let matched = false;
+  try {
+    for (const entry of completedInput) {
+      keysAre(
+        entry,
+        [
+          "workspaceLocator",
+          "promiseId",
+          "receiptId",
+          "revisionId",
+          "bindingId",
+          "packageDigest",
+          "workflowDigest",
+        ],
+        "completed qualification",
+      );
+      const original = validateQualificationMetadata({
+        schemaVersion: "continuity-qualification-meta/v1",
+        workspaceLocator: entry.workspaceLocator,
+        receiptId: entry.receiptId,
+        revisionId: entry.revisionId,
+        bindingId: entry.bindingId,
+        workflowDigest: entry.workflowDigest,
+      });
+      const packageHash = digestField(entry.packageDigest, "completed qualification.packageDigest");
+      if (typeof entry.promiseId !== "string" || !/^prom_[a-z0-9]{8,64}$/.test(entry.promiseId))
+        return false;
+      if (
+        entry.promiseId === pkg.promise.id &&
+        packageHash === pkg.packageDigest &&
+        original.workspaceLocator === metadata.workspaceLocator &&
+        original.receiptId === metadata.receiptId &&
+        original.revisionId === metadata.revisionId &&
+        original.bindingId === metadata.bindingId &&
+        original.workflowDigest === metadata.workflowDigest
+      )
+        matched = true;
+    }
+  } catch {
+    return false;
+  }
+  return matched && (await verifyLockedMaterials(pkg, executionRoot));
+}
+
 function githubQualificationMetadata(metadata: QualificationMetadata): QualificationMetadata & {
   repository: string;
   repositoryId: string;

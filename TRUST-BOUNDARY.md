@@ -108,3 +108,31 @@ refusal cannot identify which check refused it, so operator corroboration is
 mandatory. No input grants authority or changes the request body. Fork restrictions
 and registration refusals may prevent reaching this probe; those outcomes do not
 count as qualification intake proof.
+
+
+## Completion-aware qualification
+
+Registration may return an optional, bounded `completedQualifications` list. Each
+entry contains only workspace locator, promise/receipt/revision/binding identifiers,
+package digest and the original qualification workflow digest. It is setup advice,
+not a verification manifest or new evidence. Older servers omit it and the runner
+continues through ordinary qualification intake.
+
+Before running setup controls, the immutable runner compares the original packet,
+sealed package and all locked file bytes with that list. Only an exact completed
+match skips setup. Missing or malformed advice, a changed packet/package, and broken
+custody cannot produce a completed match. Compatible attestor upgrades can retain
+the original packet digest: the server authenticates the current enrolled workflow
+before supplying advice and requires the original binding to remain approved and active.
+Ordinary target verification always runs against its unchanged frozen manifest.
+A completion response cannot select code, a network destination, a workflow identity,
+or a required-verification subset. No permissions or publisher artifacts expand.
+
+Re-test the actual prebuilt executable and extracted qualification-job shell for
+first setup, next push without cleanup, retry, empty/invalid advice, changed packet
+identities, resealed packages and tampered files. The private lifecycle gate must
+also exercise actual server registration, qualification intake and activation,
+compatible release upgrade, retired/inactive binding suppression, and unchanged
+ordinary verification requirements. Hosted cross-repository evidence for the exact
+candidate remains required before production support. Deterministic test success
+alone does not establish those hosted results.
