@@ -1,28 +1,57 @@
-# Security review and release-gate ledger
+# Security review
 
-This document preserves why the public attestor has its current shape and the evidence
-required before anyone treats a commit as a release. It is both a cold-start handoff and
-a review checklist; checking a box requires current evidence for the exact commit under
-review.
+This document records the threat model behind the attestor workflow and runner, the
+design decision that most shapes them, and the checks a commit must pass before it is
+treated as a release. Every item applies to the exact commit under review: checking one
+off requires current evidence for that commit, not for an earlier one.
 
-## Original trust failure
+[README.md](README.md) explains what the workflow does, [SECURITY.md](SECURITY.md)
+describes its protections, and [TRUST-BOUNDARY.md](TRUST-BOUNDARY.md) lists the exact
+information exchanged with Balladeer's service.
 
-The first implementation pinned the reusable workflow in the customer caller, but the
-registration response selected an attestor repository and SHA that a later source-reading
-job checked out and executed. The pin protected the workflow YAML, not the executable.
-If the server response were wrong or compromised, customer CI could execute different
-code beside the checked-out customer source. That defeated the public trust anchor.
+## Threat model
 
-The hardened design uses only GitHub-owned `job.workflow_*` context for executable
-identity. Each source-reading job requires `Balladeer-Labs/attestor`, the exact reusable
-workflow path, an immutable workflow SHA, and a matching checkout `HEAD`. The checkout
-is moved to `RUNNER_TEMP` and made read-only before any customer verifier runs. The
-registration response cannot select a repository, revision, or executable. There is no
+The workflow runs inside the calling repository's GitHub Actions, next to that
+repository's checked-out source. The review is organized around these threats:
+
+- **Choosing what code runs.** A wrong or compromised response from Balladeer's service,
+  a caller input, a repository variable, a branch, or a tag must never decide which
+  executable runs beside the calling repository's source.
+- **Redirecting identity or results.** A caller must not be able to send an OIDC token
+  minted for Balladeer, or the results, to any other destination or audience.
+- **Moving source or output off the runner.** Only the closed, documented fields may reach
+  Balladeer. Source, fixtures, verifier programs, file paths, and raw output stay on the
+  runner.
+- **Changing what a verifier checks.** Accidental edits and ordinary tampering, including
+  by coding agents, to a promise's verifier, fixtures, or helper scripts must be reported
+  as `custody-invalid` rather than trusted.
+- **Forging workflow commands.** Verifier output echoed to the job log must never be
+  interpreted by GitHub as a workflow command or annotation.
+- **Misreporting a crash.** A verifier that cannot produce a verdict must never be
+  reported as a pass or as a refutation.
+
+Two limits are documented rather than defended: the runner is not a sandbox against a
+deliberately malicious verifier in the calling repository, and GitHub Enterprise Server,
+which lacks the required workflow-identity properties, is not supported.
+
+## Design note: how the executable is selected
+
+In an early design, the calling repository's workflow pinned the reusable workflow, but
+the registration response selected an attestor repository and SHA that a later
+source-reading job checked out and executed. The pin protected the workflow YAML, not the
+executable. If that response were wrong or compromised, CI could have executed different
+code beside the checked-out source.
+
+The current design takes executable identity only from GitHub's own `job.workflow_*`
+context. Each source-reading job requires `Balladeer-Labs/attestor`, the exact reusable
+workflow path, an immutable workflow SHA, and a matching checkout `HEAD`. The checkout is
+moved to `RUNNER_TEMP` and made read-only before any verifier runs. The registration
+response cannot select a repository, revision, or executable, and there is no
 caller-provided setup command.
 
-Do not reintroduce the original shape under another name: a release URL, artifact,
-download manifest, server response, caller input, variable, branch, tag, or fallback
-path cannot decide what executable runs.
+The same flaw must not return under another name: a release URL, artifact, download
+manifest, server response, caller input, variable, branch, tag, or fallback path cannot
+decide what executable runs.
 
 ## Exact re-test categories
 
@@ -31,45 +60,47 @@ For the exact candidate SHA, review or exercise every applicable category:
 - **Executable selection:** attempt to return a different repository, SHA, executable,
   or download location from registration; confirm none is consumed. Attempt caller
   overrides. Confirm the workflow fails closed for a mutable or mismatched workflow
-  ref, unexpected repository/path, missing identity property, or mismatched checkout
-  `HEAD`. Copied/local workflow variants must not authenticate as this attestor.
-- **Fixed identity and egress:** confirm the control-plane origin and OIDC audience occur
+  ref, unexpected repository or path, missing identity property, or mismatched checkout
+  `HEAD`. Copied or local workflow variants must not authenticate as this attestor.
+- **Fixed identity and egress:** confirm the service origin and OIDC audience occur
   exactly once as fixed workflow constants and cannot be redirected by inputs, variables,
-  or secrets. Exercise a wrong audience and wrong called-workflow identity; both must be
-  rejected by the service.
-- **Privilege and data isolation:** confirm only registration/publisher jobs can mint
-  OIDC, those jobs never check out customer source, and source-reading jobs cannot mint
-  OIDC. Inspect uploaded artifacts and HTTP bodies to prove they contain only the closed
-  schemas described in `TRUST-BOUNDARY.md`, never raw output or files.
+  or secrets. Exercise a wrong audience and a wrong called-workflow identity; Balladeer's
+  service must reject both.
+- **Privilege and data isolation:** confirm only the registration and publishing jobs can
+  mint OIDC, those jobs never check out the calling repository's source, and
+  source-reading jobs cannot mint OIDC. Inspect uploaded artifacts and HTTP bodies to
+  prove they contain only the closed schemas described in `TRUST-BOUNDARY.md`, never raw
+  output or files.
 - **Runner provenance:** reproduce `release/continuity-runner` byte-for-byte from source,
   confirm every third-party action is full-SHA pinned, confirm the exact Node and Ubuntu
-  versions, and confirm customer CI performs no attestor install or compilation.
+  versions, and confirm the calling repository's CI performs no attestor install or
+  compilation.
 - **Verifier custody:** reject missing, extra, changed, symlinked, special, escaping, or
-  duplicate promise material. Confirm verifier entrypoints stay inside the declared
-  promise tree, all regular files in that tree are declared and digest-locked, and
-  assertion-defining helpers cannot hide outside it. Product code used as the system
-  under test may remain outside the custody claim.
+  duplicate promise material. Confirm verifier entry points stay inside the declared
+  promise folder, all regular files in that folder are declared and digest-locked, and
+  helpers that define the assertion cannot hide outside it. Product code used as the
+  system under test may remain outside the custody claim.
 - **Setup-hook poisoning:** confirm no free-form setup command or equivalent pre-verifier
   execution surface exists. Preparation that determines the assertion must be declared
   package material.
-- **Bounded execution:** confirm controls and promises run serially, verifier processes
-  are time-bounded, every job has a wall-clock timeout, and every authored HTTP request
-  has connection and total timeouts.
-- **Customer-log output:** confirm verifier stdout and stderr reach the customer's own job
-  log and nothing else. Inspect the published artifact and HTTP bodies for echoed text;
-  they must still carry only normalized outcomes and digests. Exercise a verifier that
-  emits `::error::`, `::stop-commands::`, ANSI escapes, carriage returns, and more than
-  1 MiB on each stream: every line must appear behind the fixed prefix, no line may be
-  parsed by GitHub as a workflow command, and the echo must stop at the byte bound while
-  the digest still covers every byte. Confirm no control-plane response content is printed
-  beyond bounded promise ids.
+- **Bounded execution:** confirm controls and promises run serially within a job, verifier
+  processes are time-bounded, every job has a wall-clock timeout, and every authored HTTP
+  request has connection and total timeouts.
+- **Job-log output:** confirm verifier standard output and standard error reach the
+  calling repository's own job log and nothing else. Inspect the published artifact and
+  HTTP bodies for echoed text; they must still carry only normalized outcomes and digests.
+  Exercise a verifier that emits `::error::`, `::stop-commands::`, ANSI escapes, carriage
+  returns, and more than 1 MiB on each stream: every line must appear behind the fixed
+  prefix, no line may be parsed by GitHub as a workflow command, and the echo must stop at
+  the byte bound while the digest still covers every byte. Confirm the runner prints
+  nothing from a service response beyond bounded promise IDs.
 - **Per-package isolation:** confirm one missing, re-sealed, ambiguous, or unreadable
-  package yields exactly one custody-invalid result for that promise while every other
+  package yields exactly one `custody-invalid` result for that promise while every other
   promise still runs and publishes. Confirm the result count still equals the frozen
-  manifest's promise count, that the custody-invalid result carries the digest the
-  manifest expected, that no verifier ran for it, and that the advisory check still fails
-  when any result is not a pass. Isolation must never let a run execute a package the
-  manifest did not name.
+  manifest's promise count, that the `custody-invalid` result carries the digest the
+  manifest expected, that no verifier ran for it, and that the check still fails when any
+  result is not a pass. Isolation must never let a run execute a package the manifest did
+  not name.
 - **Crash versus refusal:** confirm a verifier that cannot produce a verdict is never
   reported as a pass and never as a refutation. Exercise, for the target run and for the
   known-bad control, a crash at import, a missing interpreter, a wall-clock timeout, a
@@ -79,156 +110,97 @@ For the exact candidate SHA, review or exercise every applicable category:
   `timed_out` with the reason code that names it, and the known-bad control's crash must
   leave the package unqualified. Exercise the skipped-suite case in jest-junit's shape as
   well, where the `<testsuites>` root carries the totals and only the child `<testsuite>`
-  elements carry `skipped`: read from the root alone that report is a green suite that
-  exercised nothing, on the target run an owner trusts most. Confirm the result document is
-  deleted before the process starts, so a report left by a previous run cannot be replayed
-  as this run's verdict, and that a document path escaping the checkout, reached through a
-  symbolic link, or reached through a symbolically linked parent directory is
-  `custody-invalid` with nothing outside the checkout deleted. Confirm the document's text
-  never reaches a published field, an annotation, or standard output, and that no XML or
-  parsing library was added to read it. Confirm an exit-code-only package can still pass but
-  can never claim a refutation, and that its receipt says so in `resultProtocol` rather than
-  leaving the control plane to infer it.
+  elements carry `skipped`: read from the root alone, that report looks like a green suite
+  that exercised nothing. Confirm the result document is deleted before the process
+  starts, so a report left by a previous run cannot be replayed as this run's verdict, and
+  that a document path escaping the checkout, reached through a symbolic link, or reached
+  through a symbolically linked parent directory is `custody-invalid` with nothing outside
+  the checkout deleted. Confirm the document's text never reaches a published field, an
+  annotation, or standard output, and that no XML or parsing library was added to read it.
+  Confirm an exit-code-only package can still pass but can never claim a refutation, and
+  that its receipt says so in `resultProtocol` rather than leaving the service to infer it.
 - **Receipt wire agreement:** confirm the qualification receipt's exact key set, including
   `resultProtocol` and an explicit `null` `outcomeReason` on a control that reached a
-  verdict, is what the control plane's intake parses. A key this runner sends and the
-  server refuses answers HTTP 400 on the customer's default branch, reddens their check for
-  a Balladeer-side reason, and stores no receipt at all, so no fixture written on either
-  side alone is evidence: the check must run this release's own runner against the server's
-  own schemas.
-- **Protocol binding and replay:** exercise a good run plus wrong repository/owner IDs,
-  wrong caller ref or workflow, wrong target/source SHA, stale or reused challenge,
-  mismatched manifest/package digests, incomplete results, and a revoked attestor release.
-  All negative cases must fail closed or record the deliberately documented Unknown state.
-- **Public-repository hygiene:** inspect the entire allowlisted inventory for customer
-  identity/material, private service identifiers or source, credentials, environment
-  files, deployment history, local paths, unexpected network clients, and unreviewed
-  binaries.
+  verdict, is what Balladeer's service accepts. A key this runner sends and the service
+  refuses answers HTTP 400 on the calling repository's default branch, turns its check red
+  for a reason outside that repository, and stores no receipt, so a fixture written on
+  either side alone is not evidence: the check must run this release's own runner against
+  the service itself.
+- **Protocol binding and replay:** exercise a good run plus wrong repository or owner IDs,
+  wrong caller ref or workflow, wrong target or source SHA, a stale or reused challenge,
+  mismatched manifest or package digests, incomplete results, and a revoked attestor
+  release. All negative cases must fail closed or record the documented unknown state.
+- **Optional self-check switches:** confirm `verify_replay_boundaries` and
+  `verify_pr_qualification_boundary` both default to off and grant no extra permissions,
+  checkouts, destinations, or caller hooks. With replay checks on, a repeated target
+  publication must conflict, an identical qualified receipt must be reported as replayed,
+  and a receipt with one changed result digest must conflict, with no extra lifecycle
+  event from the duplicates. With the pull-request probe on, qualification must be refused
+  and no receipt stored or protection started; an HTTP 400 `invalid_request` alone does not
+  show why the request was refused, so a schema or identity refusal must not count.
+  After a controlled run, turn both switches off and confirm ordinary publication works
+  and pull requests again skip qualification. `scripts/check-publisher-replay.mjs` tests
+  the extracted shell offline; those are command-shape tests, not evidence about the
+  service.
+- **Agreed wording:** the package accepts only the optional `oneSentenceOutcome` (160
+  characters) and `saidWords` (2,000 characters, also optional on each example), preserves
+  present text exactly, and covers it with the package and semantic digests. Re-test the
+  form without these fields, each field alone and together, Unicode and maximum lengths,
+  malformed, empty, and oversized values, unknown keys, removed or changed wording under an
+  old semantic digest, and a stale package digest after a semantic change.
+- **Completion-aware qualification:** registration may return a bounded list of
+  qualifications already completed. It is setup advice, not a verification manifest or
+  evidence, and it cannot select code, a network destination, a workflow identity, or a
+  subset of required verification. Re-test the prebuilt executable and extracted
+  qualification-job shell for first setup, the next push without cleanup, a retry, empty
+  and invalid advice, changed identities, re-sealed packages, and tampered files. Hosted
+  testing must also cover registration, qualification intake and activation, a compatible
+  release upgrade, withheld advice for retired or inactive verifiers, and unchanged
+  ordinary verification requirements.
+- **Public-repository hygiene:** inspect the entire allowlisted inventory for identity or
+  material from any real repository, private service identifiers or source, credentials,
+  environment files, deployment history, local paths, unexpected network clients, and
+  unreviewed binaries.
 - **Compatibility boundary:** exercise GitHub.com with the documented caller permissions.
   GitHub Enterprise Server remains unsupported while it lacks the required
   `job.workflow_*` properties; do not add an identity fallback.
 
-## Gates for the initial release
+## Release checklist
 
-No unchecked item may be described as complete:
+A commit is not a release until each item holds for its exact SHA:
 
-- [ ] `pnpm run typecheck`, `pnpm run build:release`, and `pnpm run check-release` pass
-      from a frozen install for the exact candidate SHA.
-- [ ] The generated runner diff has been compared with its TypeScript source, and the
-      complete public inventory has been reviewed.
-- [ ] An independent security re-review has closed every applicable category above for
-      the exact candidate SHA.
-- [ ] Repository rules protect `main`, require the `verify-release` check and pull
-      requests, and prevent force pushes and deletion.
-- [ ] The CODEOWNERS review requirement is actually enforceable. It is not currently
-      enforceable with only one maintainer; do not claim independent approval until a
-      second authorized reviewer exists and reviews the exact candidate.
-- [ ] A separate-owner, synthetic GitHub repository calls the candidate by its full SHA
-      and proves the good, substantial-refactor, intentional-change, and verifier-tamper
-      paths without exposing customer material.
-- [ ] Adversarial canaries reject copied/local workflow identity, mutable references,
-      wrong audience, replay, wrong target SHA, incomplete results, and altered verifier
-      material.
-- [ ] After merge, the immutable `main` SHA receives the same deterministic checks and
-      final synthetic cross-repository canary before it is marked supported by the
-      production release registry or included in a customer workflow.
+- `pnpm run typecheck`, `pnpm run build:release`, and `pnpm run check-release` pass from a
+  frozen install.
+- The generated runner diff has been compared with its TypeScript source, and the
+  complete public inventory has been reviewed.
+- A security re-review has closed every applicable category above.
+- Repository rules protect `main`, require the `verify-release` check and pull requests,
+  and prevent force pushes and deletion.
+- Independent approval is claimed only when a reviewer other than the author has reviewed
+  the exact candidate.
+- A separate-owner, synthetic GitHub repository calls the candidate by its full SHA and
+  proves the good, substantial-refactor, intentional-change, and verifier-tamper paths
+  without exposing any real repository's material.
+- Adversarial canaries reject copied or local workflow identity, mutable references, a
+  wrong audience, replay, a wrong target SHA, incomplete results, and altered verifier
+  material.
+- After merge, the immutable `main` SHA receives the same deterministic checks and a final
+  synthetic cross-repository canary before it is marked supported in Balladeer's release
+  registry or pinned in any calling repository's workflow.
 
-A pre-merge canary may use only synthetic material and an isolated, non-customer
-enrollment. It is evidence about the candidate, not authority to register the release as
-production-supported. Tags are optional discovery metadata and never authorization.
+A pre-merge canary may use only synthetic material and an isolated test workspace. It is
+evidence about the candidate, not authority to mark the release supported. Tags are
+optional discovery metadata and never authorization.
 
-## Relationship to the private control plane
+## Relationship to Balladeer's service
 
-This public draft is one half of a two-repository change. Private control-plane draft PR
-#1, at https://github.com/Bobby-tables1/balladeer/pull/1, implements the application-side
-lifecycle and release authority it expects to pair with this workflow; the exact private
-head that currently carries a finished green verdict is recorded in that repository's
-`docs/continuation-handoff.md`, not here, so this document never pins a commit it cannot
-keep true. That private work is coordination context, not trusted executable input and not
-proof that either side is ready.
+The workflow and runner here pair with Balladeer's service, whose source is not public.
+Before an end-to-end canary, compare the exact commits on both sides for protocol fields,
+the fixed origin and audience, GitHub OIDC claims, release standing, challenge replay
+rules, manifest and result schemas, and revocation behavior. The service's implementation
+and identifiers stay out of this repository, and nothing from it is trusted as executable
+input here. The public runner and workflow remain independently reviewable and are
+selected only by GitHub-owned workflow identity.
 
-Before an end-to-end canary, compare the two exact heads for protocol fields, fixed origin
-and audience, GitHub OIDC claims, release/enrollment standing, challenge replay rules,
-manifest/result schemas, and revocation behavior. Keep implementation details and all
-private identifiers in the private repository, including the coordination commit itself;
-do not copy its source or secrets here. The public runner and workflow remain
-independently reviewable and are selected only by GitHub-owned workflow identity.
-
-Neither draft is merged, tagged, production-registered, or approved for customer use
-merely because this checklist exists. The release gates above and the private
-control-plane's own deployment gates remain independent.
-
-
-## Pending release: optional same-job replay self-checks
-
-Trust claim affected: a spent target challenge cannot be applied again; an exact
-qualified receipt is idempotent while changed content under its identity conflicts.
-The default-off boolean enables fixed requests only after successful default-branch
-publication, in the existing token-bearing publisher with no checkout. No runner
-or generated executable changes. `scripts/check-publisher-replay.mjs` extracts the
-actual shell and uses a synthetic local curl replacement to check success,
-default-off, undecided controls, unexpected acceptance and wrong refusal classes.
-These are offline command-shape tests, not hosted server proof.
-
-Before registration/customer use, qualify the exact public commit through release
-integrity and review its diff. In an authorized isolated cross-repository run,
-observe one original target application plus duplicate conflict, and one qualified
-receipt application plus unchanged replay and changed-content conflict. Verify no
-extra lifecycle event or posture change from duplicates, remove the opt-in and
-re-run ordinary publication. PR-context qualification refusal is enabled separately as described below.
-
-PR qualification probe: independently opt in using the second boolean. Default
-behavior remains push-only qualification. Re-test a valid enrolled pull request
-with runner-generated closed receipt and exact run/attempt identity, then confirm
-intended intake refusal in bounded operator evidence and no new receipt, active
-binding or posture mutation. Current HTTP 400 `invalid_request` alone is insufficient;
-a schema or identity refusal must not count. Offline extracted-shell tests cover
-the expected refusal, default-off, unexpected acceptance and wrong refusal class.
-After the controlled run remove the opt-in and qualification metadata, then confirm
-ordinary pull requests again skip qualification jobs.
-
-## Optional agreed wording compatibility
-
-Trust claim affected: the runner accepts the full agreed meaning without dropping
-owner wording or changing its digest. The package admits only the optional
-`oneSentenceOutcome` (160 characters) and `saidWords` (2,000 characters), with
-`saidWords` also optional on each example. Missing keys stay absent; present text
-is preserved exactly. The package and semantic digests continue covering it.
-
-Re-test the old absent-field form, every new field independently and together,
-Unicode and maximum lengths, malformed/empty/oversized values, unknown keys,
-removed or changed wording under an old semantic digest, and a stale package
-digest after semantic changes. Smoke fixtures must be synthetic and public-safe.
-Reproduce the generated runner and run the same controls from an independent
-synthetic repository at the exact release SHA before production registration.
-The workflow, executable-selection guards, permissions, fixed destinations and
-closed result/receipt wire formats are unchanged. No new customer content leaves
-the runner. These deterministic checks do not claim customer qualification.
-
-
-## Completion-aware qualification
-
-Registration may return an optional, bounded `completedQualifications` list. Each
-entry contains only workspace locator, promise/receipt/revision/binding identifiers,
-package digest and the original qualification workflow digest. It is setup advice,
-not a verification manifest or new evidence. Older servers omit it and the runner
-continues through ordinary qualification intake.
-
-Before running setup controls, the immutable runner compares the original packet,
-sealed package and all locked file bytes with that list. Only an exact completed
-match skips setup. Missing or malformed advice, a changed packet/package, and broken
-custody cannot produce a completed match. Compatible attestor upgrades can retain
-the original packet digest: the server authenticates the current enrolled workflow
-before supplying advice and requires the original binding to remain approved and active.
-Ordinary target verification always runs against its unchanged frozen manifest.
-A completion response cannot select code, a network destination, a workflow identity,
-or a required-verification subset. No permissions or publisher artifacts expand.
-
-Re-test the actual prebuilt executable and extracted qualification-job shell for
-first setup, next push without cleanup, retry, empty/invalid advice, changed packet
-identities, resealed packages and tampered files. The private lifecycle gate must
-also exercise actual server registration, qualification intake and activation,
-compatible release upgrade, retired/inactive binding suppression, and unchanged
-ordinary verification requirements. Hosted cross-repository evidence for the exact
-candidate remains required before production support. Deterministic test success
-alone does not establish those hosted results.
+Passing this checklist does not by itself make a release supported. Balladeer's service
+has its own deployment gates, and the two are independent.

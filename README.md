@@ -202,10 +202,6 @@ To rebuild the committed runner in place instead, run `pnpm run build:release`;
 `git status` should then show no changes. When your caller moves to a new release,
 `git diff OLD_SHA NEW_SHA` shows exactly what changed.
 
-This repository currently has one maintainer, so release commits have not had review by
-a second person. [RELEASE-POLICY.md](RELEASE-POLICY.md) states exactly what its branch
-protection does and does not prove.
-
 ## Reading a check result
 
 Every active promise gets exactly one outcome per run:

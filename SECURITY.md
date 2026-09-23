@@ -214,5 +214,4 @@ are enabled on this repository.
 A change to the address, token audience, workflow, runner, or release policy is
 security-sensitive. It reaches `main` only through a pull request that passes the release
 check, produces a new commit SHA, and is offered to repositories only after an explicit
-update to Balladeer's release registry. See [RELEASE-POLICY.md](RELEASE-POLICY.md),
-including what review a release has had while this repository has a single maintainer.
+update to Balladeer's release registry. See [RELEASE-POLICY.md](RELEASE-POLICY.md).
