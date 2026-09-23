@@ -82,11 +82,11 @@ jobs:
 
 ### The jobs
 
-Permissions are set per job. The jobs that check out your code cannot request a token, and
-the jobs that can request a token never check out your code and handle only closed JSON
-documents.
+Permissions are set per job. In the table, "Reads code" means the job checks out your
+commit, and "Token" means it can request a GitHub OIDC token. No job does both: the jobs
+that can request a token never check out your code and handle only closed JSON documents.
 
-| Job | Checks out your code | Can request an OIDC token | What it does |
+| Job | Reads code | Token | What it does |
 | --- | --- | --- | --- |
 | `register` | No | Yes | Identifies the run to Balladeer's service and receives the list of active promises (promise IDs and sealed-package digests). |
 | `verify` | Yes | No | Runs every active promise's verifier against the commit. |
