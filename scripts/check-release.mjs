@@ -323,19 +323,18 @@ const assertions = [
   [
     claude.includes("job.workflow_repository") &&
       claude.includes("job.workflow_sha") &&
-      claude.includes("control-plane response") &&
+      claude.includes("response from Balladeer's service") &&
       claude.includes("There is no caller-supplied setup hook") &&
       claude.includes("Do not merge, tag, register a production-supported release"),
     "agent instructions preserve executable-selection and release gates",
   ],
   [
-    securityReview.includes("Original trust failure") &&
+    securityReview.includes("Design note: how the executable is selected") &&
       securityReview.includes("registration response selected an attestor repository and SHA") &&
       securityReview.includes("Exact re-test categories") &&
       securityReview.includes("separate-owner, synthetic GitHub repository") &&
-      securityReview.toLowerCase().includes("private control-plane draft pr") &&
-      securityReview.includes("https://github.com/Bobby-tables1/balladeer/pull/1"),
-    "security review preserves failure, adversarial gates, and paired handoff",
+      securityReview.includes("Relationship to Balladeer's service"),
+    "security review preserves the executable-selection flaw, adversarial gates, and service pairing",
   ],
   [codeowners.includes("@Bobby-tables1"), "release owner"],
   [lockfile.isFile && lockfile.size > 0, "frozen dependency lockfile"],

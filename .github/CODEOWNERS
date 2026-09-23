@@ -1,4 +1,4 @@
-# Every public trust-anchor change requires review by the Balladeer owner.
+# Every change to this public repository requires code owner review.
 * @Bobby-tables1
 
 # Call these out explicitly because a change alters what customer CI executes

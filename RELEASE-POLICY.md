@@ -15,30 +15,26 @@ scanning, and push protection are enabled. Releases must be created by a Ballade
 maintainer; GitHub write access is not delegated to a customer repository or its Actions
 token.
 
-Read that protection together with the single-maintainer exception below, which states
-what it does and does not prove today.
+Organization owners are a bypass actor on this ruleset, and a merge may go through that
+bypass instead of a code owner's approval. GitHub records every bypassed merge in this
+repository's rule insights, so each use of the bypass can be inspected here rather than
+merely asserted.
 
-## Bootstrap exception: one maintainer
+## What branch protection does and does not prove
 
-Balladeer has one maintainer, who is also the sole CODEOWNER in `.github/CODEOWNERS`.
-GitHub does not allow an author to approve their own pull request, so the approval rule
-above cannot be satisfied honestly at this size. Rather than weaken the rule or add a
-second account that is really the same person, the organization owner holds a recorded
-bypass on the ruleset and merges through it.
+- Every commit on `main` reached it through a pull request whose `verify-release` check
+  was green, and it is protected against rewriting and deletion.
+- A merged pull request is not, by itself, evidence that anyone other than its author
+  reviewed it. GitHub does not let an author approve their own pull request, and a merge
+  may have used the bypass. Check the pull request's reviews and the rule insights before
+  relying on independent review.
+- Independent review of a release is claimed only when a code owner other than the author
+  approved the exact commit.
 
-What a reader may and may not conclude from a release commit while this exception stands:
-
-- Every commit on `main` reached it through a pull request whose `verify-release` check was
-  green, and is protected against rewriting and deletion. Those claims are true now.
-- A release commit has not been reviewed by a second person. A merged pull request in this
-  repository is not evidence of independent review.
-- Each bypassed merge is recorded by GitHub in this repository's rule insights, so the
-  exception is inspectable here rather than merely asserted.
-
-This exception ends when a second maintainer exists. Add them to `.github/CODEOWNERS`,
-remove the bypass actor from the ruleset, and delete this section in the same pull request.
-Until then this section, not the presence of protection, is the accurate statement of what
-review a release has had.
+The bypass is removed once every pull request can be approved by a code owner other than
+its author, and this section is updated in the same pull request. Until then this section,
+not the presence of protection, is the accurate statement of what review a release has
+had.
 
 ## Publishing a release
 
@@ -81,3 +77,34 @@ To roll back behavior, publish a new reviewed commit whose source and prebuilt r
 restore the safe implementation, then enroll that new SHA. Do not move a tag backward
 or tell customers to pin an unreviewed historical commit. This preserves an ordered,
 inspectable release ledger even when implementation behavior is reverted.
+
+## For maintainers: optional publication self-checks
+
+These two workflow inputs exist for controlled proof runs by maintainers. Both default to
+`false`, and a caller that does not set them is unaffected.
+
+The reusable workflow accepts `verify_replay_boundaries: true` for a controlled
+proof run. It defaults to false and only takes effect on a push to the supplied
+default branch. After successful publication, the publisher repeats the same
+target request and requires a conflict. For qualified receipts it requires an
+identical repeat to be reported as replayed, then requires a copy with one changed
+result digest to conflict. A failed expectation fails the publisher job; already
+published evidence is not rolled back. Nonqualifying receipts skip this check.
+
+This switch only enables fixed, bounded requests to the existing service origin.
+It cannot select an executable, checkout, endpoint or OIDC audience. The same job
+uses its existing token; no token or request body is printed. Use a reviewed,
+registered immutable release and obtain authorization for the controlled requests
+before enabling it. Disable the input after the proof run.
+
+`verify_pr_qualification_boundary: true` is a separate default-off proof switch.
+On pull-request events only, it allows the existing qualification controls to
+produce closed receipts and the existing isolated publisher to submit them. The
+publisher requires the current bounded HTTP 400 `invalid_request` refusal and
+skips normal acceptance handling. Unexpected acceptance fails the proof. This
+response class is generic: a maintainer must corroborate the intended default-branch
+restriction and absence of a new stored receipt or activation. It is not standalone
+proof of why a request was refused. A run without qualification metadata produces
+no receipt and establishes no qualification-refusal proof. Ordinary pull-request target
+verification remains advisory; this switch does not change the authority of
+Balladeer's service.
