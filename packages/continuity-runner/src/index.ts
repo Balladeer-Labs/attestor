@@ -39,6 +39,12 @@ export interface PromiseScope {
   repositoryId: string;
   surfaces: string[];
   labels: string[];
+  /** Who the approved meaning applies to; absent on meanings recorded before it existed. */
+  appliesTo?:
+    | { everyone: true }
+    | { conditions: { dimension: string; effect: "includes" | "excludes"; value: string }[] };
+  /** When the approved meaning applies, as YYYY-MM-DD dates; absent when none were stated. */
+  effective?: { from?: string; until?: string };
 }
 
 export interface PromiseMeaning {
@@ -527,6 +533,68 @@ function optionalWording(
   const text = stringField(value[key], `${label}.${key}`);
   if (text.length > max) throw new Error(`${label}.${key} must be at most ${max} characters`);
 }
+// Who and when an approved meaning applies. Validated as closed shapes so the
+// package can carry them exactly as agreed; never interpreted, trimmed or
+// defaulted here. Missing keys stay absent.
+const SCOPE_DIMENSIONS = [
+  "customers",
+  "role",
+  "environment",
+  "region",
+  "flag",
+  "surface",
+  "version",
+  "other",
+];
+const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
+function calendarDate(value: unknown, label: string): string {
+  if (typeof value !== "string" || !CALENDAR_DATE.test(value))
+    throw new Error(`${label} must be a YYYY-MM-DD date`);
+  const [year, month, day] = value.split("-").map(Number) as [number, number, number];
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  )
+    throw new Error(`${label} must be a real calendar date`);
+  return value;
+}
+function validateAppliesTo(value: unknown): void {
+  const label = "promise.scope.appliesTo";
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error(`${label} must be an object`);
+  if (Object.hasOwn(value, "everyone")) {
+    keysAre(value, ["everyone"], label);
+    if (value.everyone !== true) throw new Error(`${label}.everyone must be true`);
+    return;
+  }
+  keysAre(value, ["conditions"], label);
+  const conditions = value.conditions;
+  if (!Array.isArray(conditions) || conditions.length < 1 || conditions.length > 24)
+    throw new Error(`${label}.conditions must hold 1 to 24 conditions`);
+  conditions.forEach((condition, index) => {
+    const at = `${label}.conditions[${index}]`;
+    keysAre(condition, ["dimension", "effect", "value"], at);
+    if (typeof condition.dimension !== "string" || !SCOPE_DIMENSIONS.includes(condition.dimension))
+      throw new Error(`${at}.dimension is not a known dimension`);
+    if (condition.effect !== "includes" && condition.effect !== "excludes")
+      throw new Error(`${at}.effect must be includes or excludes`);
+    const text = stringField(condition.value, `${at}.value`);
+    if (text.length > 200) throw new Error(`${at}.value must be at most 200 characters`);
+  });
+}
+function validateEffective(value: unknown): void {
+  const label = "promise.scope.effective";
+  keysAre(value, ["from", "until"], label, ["from", "until"]);
+  if (value.from === undefined && value.until === undefined)
+    throw new Error(`${label} must name from, until, or both`);
+  const from = value.from === undefined ? undefined : calendarDate(value.from, `${label}.from`);
+  const until =
+    value.until === undefined ? undefined : calendarDate(value.until, `${label}.until`);
+  if (from !== undefined && until !== undefined && from > until)
+    throw new Error(`${label}.from must not be after until`);
+}
 function stringArray(value: unknown, label: string): string[] {
   if (!Array.isArray(value) || value.some((v) => typeof v !== "string"))
     throw new Error(`${label} must be an array of strings`);
@@ -720,7 +788,21 @@ export function validatePackage(input: unknown): AcceptancePackage {
     validateExamples(input.promise[key], `promise.${key}`);
   if (input.promise.refactorExamples !== undefined)
     validateExamples(input.promise.refactorExamples, "promise.refactorExamples");
-  keysAre(input.promise.scope, ["repositoryId", "surfaces", "labels"], "promise.scope");
+  // `appliesTo` and `effective` are optional in the approved meaning, absent on
+  // every meaning recorded before them, and inside the semantic digest when
+  // present. The runner does not interpret them: it only has to admit them so
+  // the package carries the exact meaning that was agreed, which the digest
+  // check below then holds byte for byte.
+  keysAre(
+    input.promise.scope,
+    ["repositoryId", "surfaces", "labels", "appliesTo", "effective"],
+    "promise.scope",
+    ["appliesTo", "effective"],
+  );
+  if (Object.hasOwn(input.promise.scope, "appliesTo"))
+    validateAppliesTo(input.promise.scope.appliesTo);
+  if (Object.hasOwn(input.promise.scope, "effective"))
+    validateEffective(input.promise.scope.effective);
   stringField(input.promise.scope.repositoryId, "promise.scope.repositoryId");
   const surfaces = stringArray(input.promise.scope.surfaces, "promise.scope.surfaces");
   stringArray(input.promise.scope.labels, "promise.scope.labels");

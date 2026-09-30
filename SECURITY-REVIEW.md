@@ -206,6 +206,28 @@ closed result/receipt wire formats are unchanged. No new customer content leaves
 the runner. These deterministic checks do not claim customer qualification.
 
 
+## Optional scope: who and when a meaning applies
+
+Trust claim affected: the runner accepts the full agreed meaning without dropping who
+or when it applies or changing its digest. `promise.scope` admits only two optional
+keys, `appliesTo` and `effective`. `appliesTo` is either `{ "everyone": true }` or 1 to
+24 conditions of exactly `dimension` (one of customers, role, environment, region, flag,
+surface, version, other), `effect` (includes or excludes) and `value` (non-empty, at most
+200 characters). `effective` names `from`, `until` or both as real `YYYY-MM-DD` dates with
+`from` not after `until`. Missing keys stay absent; present values are preserved exactly
+and never interpreted by the runner. The package and semantic digests cover them.
+
+Re-test the old absent-key form, each key alone and together, every dimension, both
+effects, 1 and 24 conditions and the 200-character bound, malformed shapes (empty object,
+both answers at once, unknown nested or top-level scope keys, impossible or re-spelled
+dates, reversed ranges), removed keys under an old semantic digest, and a stale package
+digest. Smoke fixtures are synthetic and public-safe. The workflow, executable-selection
+guards, permissions, fixed destinations and closed result and receipt formats are
+unchanged, and no new customer content leaves the runner. Reproduce the generated
+runner and run the same controls from an independent synthetic repository at the exact
+release SHA before production registration. Deterministic checks do not claim customer
+qualification.
+
 ## Completion-aware qualification
 
 Registration may return an optional, bounded `completedQualifications` list. Each
