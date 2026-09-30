@@ -303,6 +303,69 @@ try {
     (await sealPackageDraft(noRefactorWording, root)).promise,
     noRefactorWording.promise,
   );
+
+  // Who and when an approved meaning applies (scope.appliesTo, scope.effective)
+  // is part of meaning: sealed exactly, bound into both digests, closed shapes.
+  const withScope = (extra) => {
+    const scoped = structuredClone(draft);
+    Object.assign(scoped.promise.scope, extra);
+    refreshSemanticDigest(scoped.promise);
+    return scoped;
+  };
+  const acceptedScopes = [
+    { appliesTo: { everyone: true } },
+    {
+      appliesTo: {
+        conditions: [
+          { dimension: "customers", effect: "includes", value: "Enterprise plan" },
+          { dimension: "environment", effect: "excludes", value: "sandbox" },
+        ],
+      },
+    },
+    { effective: { from: "2026-10-01" } },
+    { effective: { until: "2028-02-29" } },
+    {
+      appliesTo: { conditions: [{ dimension: "flag", effect: "includes", value: "x".repeat(200) }] },
+      effective: { from: "2026-10-01", until: "2026-10-01" },
+    },
+  ];
+  for (const extra of acceptedScopes) {
+    const scoped = withScope(extra);
+    const sealed = await sealPackageDraft(scoped, root);
+    assert.deepEqual(sealed.promise, scoped.promise, `${JSON.stringify(extra)} survives sealing`);
+    assert.deepEqual(validatePackage(JSON.parse(JSON.stringify(sealed))), sealed);
+    assert.notEqual(sealed.promise.semanticDigest, pkg.promise.semanticDigest);
+    assert.equal((await runTarget(sealed, root, sourceSha)).outcome, "pass");
+    const stripped = structuredClone(sealed);
+    for (const key of Object.keys(extra)) delete stripped.promise.scope[key];
+    stripped.packageDigest = packageDigest(stripped);
+    assert.throws(() => validatePackage(stripped), /semanticDigest does not match/);
+  }
+  const refusedScopes = [
+    [{ appliesTo: {} }, /appliesTo/],
+    [{ appliesTo: { everyone: false } }, /everyone must be true/],
+    [{ appliesTo: { everyone: true, conditions: [] } }, /unknown field: conditions/],
+    [{ appliesTo: { conditions: [] } }, /1 to 24 conditions/],
+    [
+      { appliesTo: { conditions: Array.from({ length: 25 }, () => ({ dimension: "role", effect: "includes", value: "admins" })) } },
+      /1 to 24 conditions/,
+    ],
+    [{ appliesTo: { conditions: [{ dimension: "planet", effect: "includes", value: "Mars" }] } }, /known dimension/],
+    [{ appliesTo: { conditions: [{ dimension: "role", effect: "only", value: "admins" }] } }, /includes or excludes/],
+    [{ appliesTo: { conditions: [{ dimension: "role", effect: "includes", value: " " }] } }, /non-empty string/],
+    [{ appliesTo: { conditions: [{ dimension: "role", effect: "includes", value: "x".repeat(201) }] } }, /at most 200/],
+    [{ appliesTo: { conditions: [{ dimension: "role", effect: "includes", value: "a", extra: 1 }] } }, /unknown field: extra/],
+    [{ appliesTo: [] }, /must be an object/],
+    [{ effective: {} }, /from, until, or both/],
+    [{ effective: { from: "2026-02-30" } }, /real calendar date/],
+    [{ effective: { until: "2027-02-29" } }, /real calendar date/],
+    [{ effective: { from: "2026-10-01T00:00:00Z" } }, /YYYY-MM-DD/],
+    [{ effective: { from: "2026-12-31", until: "2026-10-01" } }, /not be after until/],
+    [{ effective: { from: "2026-10-01", during: "x" } }, /unknown field: during/],
+    [{ region: "eu" }, /unknown field: region/],
+  ];
+  for (const [extra, reason] of refusedScopes)
+    await assert.rejects(sealPackageDraft(withScope(extra), root), reason, JSON.stringify(extra));
   // Optional additions do not normalize or change old packages.
   assert.equal((await sealPackageDraft(draft, root)).packageDigest, pkg.packageDigest);
 
